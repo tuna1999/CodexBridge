@@ -1,0 +1,33 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --all-features
+      - name: Build bins and examples
+        run: cargo build --bins --examples
+      - name: Validate smoke script
+        run: bash -n scripts/mcp_smoke.sh
+      - name: Validate diff whitespace
+        run: git diff --check
+      - name: MCP smoke test
+        run: scripts/mcp_smoke.sh

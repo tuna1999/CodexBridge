@@ -319,6 +319,32 @@ pub fn apply(original: &str, chunks: &[Chunk], path: &str) -> Result<String, App
             .or_else(|| lines.get(at).map(|(_, is_crlf)| *is_crlf))
             .unwrap_or_else(|| dominant_crlf(&lines));
 
+        // Map replacement lines to source lines inside each edit segment
+        // delimited by context. Using the replacement's global offset is wrong
+        // after a deletion before context: later replacements would inherit the
+        // EOL of an earlier source line. Within one edit segment, keep the
+        // existing positional replacement behavior; extra inserted lines remain
+        // unmapped and use fallback_eol below.
+        let mut replacement_old_indices = vec![None; replacement_source.len()];
+        let mut old_start = 0usize;
+        let mut new_start = 0usize;
+        for &(old_context, new_context) in &chunk.context_line_indices {
+            if old_context >= pattern.len() || new_context >= replacement_source.len() {
+                continue;
+            }
+            let paired = (old_context - old_start).min(new_context - new_start);
+            for relative in 0..paired {
+                replacement_old_indices[new_start + relative] = Some(old_start + relative);
+            }
+            replacement_old_indices[new_context] = Some(old_context);
+            old_start = old_context + 1;
+            new_start = new_context + 1;
+        }
+        let paired = (pattern.len() - old_start).min(replacement_source.len() - new_start);
+        for relative in 0..paired {
+            replacement_old_indices[new_start + relative] = Some(old_start + relative);
+        }
+
         // Context lines keep their exact source text *and* original EOL. The
         // parser records their identity explicitly; inferring context from
         // equal old/new text is wrong after deletions and with duplicates.
@@ -343,7 +369,9 @@ pub fn apply(original: &str, chunks: &[Chunk], path: &str) -> Result<String, App
                 } else {
                     (
                         content.clone(),
-                        removed_eols.get(offset).copied().unwrap_or(fallback_eol),
+                        replacement_old_indices[offset]
+                            .and_then(|old_index| removed_eols.get(old_index).copied())
+                            .unwrap_or(fallback_eol),
                     )
                 }
             })
@@ -809,6 +837,22 @@ mod tests {
         // Removing the first line must not transfer its CRLF terminator to the
         // surviving context line.
         assert_eq!(apply("remove\r\nkeep\n", chunks, "f").unwrap(), "keep\n");
+    }
+
+    #[test]
+    fn regression_replacement_after_deletion_keeps_corresponding_line_ending() {
+        let actions = parse(
+            "*** Begin Patch\n*** Update File: f\n@@\n-delete-me\n keep-me \n-last\n+LAST\n*** End Patch",
+        )
+        .unwrap();
+        let Action::Update { chunks, .. } = &actions[0] else {
+            panic!()
+        };
+
+        assert_eq!(
+            apply("delete-me\r\n keep-me \nlast\r\n", chunks, "f").unwrap(),
+            " keep-me \nLAST\r\n"
+        );
     }
 
     #[tokio::test]

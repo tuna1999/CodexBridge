@@ -2,40 +2,39 @@ name: Release
 
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - "v*"
 
+# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
 permissions:
-  contents: read
+  contents: write
+  pages: write
+  id-token: write
 
 jobs:
   build:
-    name: ${{ matrix.target }}
+    name: Build ${{ matrix.name }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            binary: codex-bridge
-            archive: codex-bridge-x86_64-unknown-linux-gnu.tar.gz
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            binary: codex-bridge
-            archive: codex-bridge-aarch64-unknown-linux-gnu.tar.gz
-          - os: macos-14
-            target: aarch64-apple-darwin
-            binary: codex-bridge
-            archive: codex-bridge-aarch64-apple-darwin.tar.gz
-          - os: macos-13
-            target: x86_64-apple-darwin
-            binary: codex-bridge
-            archive: codex-bridge-x86_64-apple-darwin.tar.gz
-          - os: windows-latest
+          - name: linux-amd64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            binary: target/x86_64-unknown-linux-musl/release/codex-bridge
+            output: codex-bridge-linux-amd64
+            rustflags: ""
+          - name: windows-amd64
+            os: windows-latest
             target: x86_64-pc-windows-msvc
-            binary: codex-bridge.exe
-            archive: codex-bridge-x86_64-pc-windows-msvc.zip
+            binary: target/x86_64-pc-windows-msvc/release/codex-bridge.exe
+            output: codex-bridge-windows-amd64.exe
+            rustflags: -C target-feature=+crt-static
+          - name: mac-arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+            binary: target/aarch64-apple-darwin/release/codex-bridge
+            output: codex-bridge-mac-arm64
+            rustflags: ""
+
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -44,78 +43,54 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.target }}
-      - name: Install Linux ARM64 cross linker
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
-      - name: Build release binary
+          key: release-${{ matrix.name }}
+
+      - name: Install Linux musl toolchain
+        if: matrix.name == 'linux-amd64'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build static release
         shell: bash
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: |
           set -euo pipefail
-          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]]; then
-            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-            export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
-          fi
           cargo build --locked --release --target "${{ matrix.target }}" --bin codex-bridge
-      - name: Package Unix artifact
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p dist/package
-          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" dist/package/
-          cp README.md dist/package/
-          cp CHANGELOG.md dist/package/
-          mkdir -p dist/package/docs
-          cp docs/ARCHITECTURE.md dist/package/docs/
-          tar -C dist/package -czf "dist/${{ matrix.archive }}" .
-      - name: Package Windows artifact
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist/package | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" dist/package/
-          Copy-Item README.md dist/package/
-          Copy-Item CHANGELOG.md dist/package/
-          New-Item -ItemType Directory -Force -Path dist/package/docs | Out-Null
-          Copy-Item docs/ARCHITECTURE.md dist/package/docs/
-          Compress-Archive -Path dist/package/* -DestinationPath "dist/${{ matrix.archive }}"
+          cp "${{ matrix.binary }}" "${{ matrix.output }}"
+
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.archive }}
-          path: dist/${{ matrix.archive }}
+          name: ${{ matrix.name }}
+          path: ${{ matrix.output }}
           if-no-files-found: error
 
-  checksums:
+  release:
+    name: Release
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
         with:
-          path: dist
-          merge-multiple: true
-      - name: Create checksums
-        working-directory: dist
-        run: sha256sum codex-bridge-* > SHA256SUMS
-      - uses: actions/upload-artifact@v4
-        with:
-          name: SHA256SUMS
-          path: dist/SHA256SUMS
+          fetch-depth: 0
 
-  github-release:
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: [build, checksums]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
       - uses: actions/download-artifact@v4
         with:
-          path: dist
+          path: .
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+
+      # Create release
+      - name: Generate release tag
+        id: tag
+        run: |
+          sudo timedatectl set-timezone Asia/Ho_Chi_Minh
+          sudo date -s "$(wget -qSO- --max-redirect=0 google.com 2>&1 | grep Date: | cut -d' ' -f5-8)Z"
+          echo "release_tag=Release_$(date +"%Y.%m.%d_%H-%M-%S")" >> $GITHUB_OUTPUT
+          echo "release_hash=$(git log --format="%H" -n 1)" >> $GITHUB_OUTPUT
+      - name: Release
+        uses: softprops/action-gh-release@v1
         with:
-          generate_release_notes: true
+          body: ${{ steps.tag.outputs.release_hash }}
+          tag_name: ${{ steps.tag.outputs.release_tag }}
           files: |
-            dist/codex-bridge-*
-            dist/SHA256SUMS
+            ./codex-bridge-*
+      # Done release

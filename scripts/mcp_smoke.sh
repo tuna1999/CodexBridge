@@ -111,10 +111,12 @@ jq -e --argjson expected "$expected_tools" '(.result.tools | map(.name) | sort) 
 jq -e '.result.tools[] | select(.name == "chatgpt_turn_init") | (.description | contains("idempotent")) and (.inputSchema.properties.previous_turn_ref.type == ["string","null"]) and (.outputSchema.properties.turn_ref.type == "string") and (.outputSchema.properties.previous_turn_ref.type == ["string","null"]) and (.outputSchema.properties.instruction_hash.type == "string") and (.outputSchema.properties.state_hash.type == "string") and (.outputSchema.properties.instructions_changed.type == "boolean") and (.outputSchema.properties.state_changed.type == "boolean") and (.outputSchema.properties.turn_reused.type == "boolean") and (.outputSchema.properties.brief.type == ["string","null"]) and (.outputSchema.properties.state_update.type == ["string","null"])' "$run_root/tools.json" >/dev/null
 jq -e '.result.tools[] | select(.name == "skills_list") | .inputSchema.properties.path.type == ["string","null"]' "$run_root/tools.json" >/dev/null
 jq -e '.result.tools[] | select(.name == "skills_read") | .inputSchema.properties.path.type == ["string","null"]' "$run_root/tools.json" >/dev/null
-jq -e '.result.tools[] | select(.name == "recall") | .inputSchema.properties.offset.type == "integer" and .inputSchema.properties.max_results.type == ["integer","null"] and .inputSchema.properties.include_plan.type == "boolean"' "$run_root/tools.json" >/dev/null
+jq -e '.result.tools[] | select(.name == "recall") | .inputSchema.properties.offset.type == "integer" and .inputSchema.properties.max_results.type == ["integer","null"] and .inputSchema.properties.snapshot_hash.type == ["string","null"] and .inputSchema.properties.include_plan.type == "boolean"' "$run_root/tools.json" >/dev/null
+jq -e '.result.tools[] | select(.name == "exec_command") | .inputSchema.properties.stdin.type == ["string","null"] and .inputSchema.properties.close_stdin.type == "boolean"' "$run_root/tools.json" >/dev/null
+jq -e '.result.tools[] | select(.name == "write_stdin") | .inputSchema.properties.since_output_offset.type == ["integer","null"] and .inputSchema.properties.wait_for_exit_ms.type == ["integer","null"]' "$run_root/tools.json" >/dev/null
 jq -e '.result.tools[] | select(.name == "remember") | (.description | contains("costly to rediscover")) and (.description | contains("memory_set") | not)' "$run_root/tools.json" >/dev/null
 jq -e '.result.tools[] | select(.name == "grep") | .outputSchema.properties.incomplete.type == "boolean" and .outputSchema.properties.skipped_files.type == "integer" and .outputSchema.properties.traversal_limit_hit.type == "boolean"' "$run_root/tools.json" >/dev/null
-grep -q 'Default shell:' "$run_root/tools.json"
+jq -e '.result.tools[] | select(.name == "exec_command") | (.description | contains("Shell:")) and (.description | contains("Default backend:"))' "$run_root/tools.json" >/dev/null
 for removed in exec run_command search_files write_file read_files file_info project_info project_status memory_set plan_get task_add clock_now git_status git_commit; do
   ! grep -q "\"$removed\"" "$run_root/tools.json"
 done
@@ -616,7 +618,7 @@ sleep 1
 call_tool write_stdin 99 "$(jq -cn --arg id "$finished_session" '{session_id:$id,chars:"x",signal:"interrupt"}')" "$run_root/finished-session-mutation.json"
 jq -e '.result.isError == true and .result.structuredContent == null and ((.result.content[0].text | startswith("PROCESS_FINISHED:")) or (.result.content[0].text | startswith("FILE_NOT_FOUND:")))' "$run_root/finished-session-mutation.json" >/dev/null
 
-call_tool exec_command 17 '{"cmd":"printf iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADElEQVR42mNk+M/wHwAF/gL+XwW+WQAAAABJRU5ErkJggg== | base64 -d > pixel.png"}' "$run_root/image-write.json"
+call_tool exec_command 17 '{"cmd":"printf iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg== | base64 -d > pixel.png"}' "$run_root/image-write.json"
 call_tool view_image 18 '{"path":"pixel.png"}' "$run_root/image.json"
 grep -q 'image/png' "$run_root/image.json"
 call_tool exec_command 69 '{"cmd":"printf not-an-image > fake.png"}' "$run_root/fake-image-write.json"

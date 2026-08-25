@@ -165,7 +165,8 @@ Trong báo cáo cuối, ghi riêng case này là `C6 Codex1 duplicate-target reg
 - Chạy `podman info`.
 - Chạy container thật, ví dụ:
   `podman run --rm docker.io/library/alpine:3.22 sh -c 'echo podman-in-podman-ok'`
-- PASS khi Podman hoạt động. Nếu default Bubblewrap không usable hoặc Podman không usable trong Bubblewrap, native YOLO fallback được chấp nhận. Không coi network availability là lỗi; project này chủ đích có network.
+- Nếu `podman run` rootless fail vì namespace/mount/permission của environment nhưng project cho phép rootful Podman, retry bằng **explicit** `sudo podman run ...`; không dựa vào shell alias. Ghi lại cả failure đầu và fallback thành công.
+- PASS khi một container thật chạy thành công. Nếu default Bubblewrap không usable hoặc Podman không usable trong Bubblewrap, native YOLO fallback được chấp nhận; native fallback không tự cấp thêm quyền cho rootless Podman. Không coi network availability là lỗi; project này chủ đích có network.
 
 ### E2. Long-running session continuation
 - Start command in > initial yield window để nhận `session_id`.
