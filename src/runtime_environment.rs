@@ -15,6 +15,7 @@ pub struct RuntimeEnvironment {
     pub shell_kind: &'static str,
     pub shell_argv_prefix: Vec<String>,
     pub sandbox_backend: &'static str,
+    pub(crate) podman_invocation: sandbox::PodmanInvocation,
 }
 
 impl RuntimeEnvironment {
@@ -29,6 +30,7 @@ impl RuntimeEnvironment {
             shell_kind,
             shell_argv_prefix,
             sandbox_backend: sandbox::effective_default_sandbox_backend(config),
+            podman_invocation: sandbox::podman_invocation(),
         }
     }
 
@@ -39,7 +41,7 @@ impl RuntimeEnvironment {
             _ => "Write POSIX shell syntax.",
         };
         format!(
-            "Environment (identity-independent, secret-free): OS={}, architecture={}, path separator=`{}`, executable suffix=`{}`, exec shell=`{}` ({}), default exec backend={}. {} Structured project-tool paths remain relative to the active project and are disclosed only after chatgpt_turn_init; individual commands such as Podman may use a different effective backend when runtime capability probing requires it.",
+            "Environment (identity-independent, secret-free): OS={}, architecture={}, path separator=`{}`, executable suffix=`{}`, exec shell=`{}` ({}), default exec backend={}. {} {} Structured project-tool paths remain relative to the active project and are disclosed only after chatgpt_turn_init; individual commands such as Podman may use a different effective backend when runtime capability probing requires it.",
             self.os,
             self.arch,
             self.path_separator,
@@ -48,6 +50,7 @@ impl RuntimeEnvironment {
             self.shell_kind,
             self.sandbox_backend,
             shell_advice,
+            self.podman_invocation.agent_advice(),
         )
     }
 }
@@ -70,6 +73,7 @@ mod tests {
         let rendered = environment.render_agent_summary();
         assert!(rendered.contains(&environment.shell));
         assert!(rendered.contains(environment.sandbox_backend));
+        assert!(rendered.contains(environment.podman_invocation.agent_advice()));
         assert!(!rendered.contains(&config.auth_token));
         assert!(!rendered.contains(config.workspace_root.to_string_lossy().as_ref()));
     }
