@@ -16,6 +16,32 @@ use crate::{
     project::ProjectContext,
 };
 
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+pub(crate) fn hide_std_process_window(command: &mut StdCommand) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = command;
+    }
+}
+
+pub(crate) fn hide_tokio_process_window(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = command;
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum PathOperation {
     Existing,
@@ -807,6 +833,13 @@ fn powershell_script(command_text: &str) -> String {
     )
 }
 
+fn windows_pathext() -> String {
+    std::env::var("PATHEXT")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_owned())
+}
+
 fn sanitized_base_environment(command: &mut Command, use_bwrap: bool) {
     if cfg!(windows) {
         let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
@@ -815,6 +848,7 @@ fn sanitized_base_environment(command: &mut Command, use_bwrap: bool) {
         });
         let temporary = std::env::temp_dir();
         command.env("PATH", path);
+        command.env("PATHEXT", windows_pathext());
         command.env("SystemRoot", &system_root);
         command.env("WINDIR", &system_root);
         if let Ok(comspec) = std::env::var("ComSpec") {
@@ -880,13 +914,14 @@ fn running_as_root() -> bool {
 }
 
 fn command_probe(program: &str, args: &[&str]) -> bool {
-    let child = match StdCommand::new(program)
+    let mut command = StdCommand::new(program);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
+        .stderr(Stdio::null());
+    hide_std_process_window(&mut command);
+    let child = match command.spawn() {
         Ok(child) => child,
         Err(_) => return false,
     };
@@ -1270,6 +1305,7 @@ fn sanitized_base_std_environment(command: &mut StdCommand, use_bwrap: bool) {
             format!(r"{system_root}\System32;{system_root};{system_root}\System32\WindowsPowerShell\v1.0")
         });
         command.env("PATH", path);
+        command.env("PATHEXT", windows_pathext());
         command.env("SystemRoot", &system_root);
         command.env("WINDIR", &system_root);
     } else {
@@ -1324,6 +1360,7 @@ fn finalize_process_command(
         command.env(key, value);
     }
     process_limits(&mut command, timeout);
+    hide_tokio_process_window(&mut command);
     command
         .kill_on_drop(true)
         .stdin(if interactive {
@@ -1476,11 +1513,13 @@ async fn execute_prepared(
             }
             #[cfg(windows)]
             if let Some(process_id) = process_id {
-                let _ = std::process::Command::new("taskkill")
+                let mut command = std::process::Command::new("taskkill");
+                command
                     .args(["/T", "/F", "/PID", &process_id.to_string()])
                     .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
+                    .stderr(Stdio::null());
+                hide_std_process_window(&mut command);
+                let _ = command.status();
             }
             let _ = child.kill().await;
             let status = child.wait().await.ok();
@@ -1984,6 +2023,40 @@ mod tests {
             "cmd" => assert_eq!(args.last().map(String::as_str), Some("/c")),
             _ => assert_eq!(args, ["-c"]),
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sanitized_windows_environment_restores_pathext_for_command_discovery() {
+        let pathext = |command: &StdCommand| {
+            command
+            .get_envs()
+            .find_map(|(key, value)| {
+                key.to_string_lossy()
+                    .eq_ignore_ascii_case("PATHEXT")
+                    .then(|| value.map(|value| value.to_string_lossy().into_owned()))
+                    .flatten()
+            })
+            .expect("PATHEXT must be restored after env_clear on Windows")
+        };
+        let assert_exe_discovery = |value: &str| {
+            assert!(
+                value
+                    .split(';')
+                    .any(|extension| extension.eq_ignore_ascii_case(".EXE")),
+                "PATHEXT must include .EXE so PowerShell can resolve native commands"
+            );
+        };
+
+        let mut std_command = StdCommand::new("cmd.exe");
+        std_command.env_clear();
+        sanitized_base_std_environment(&mut std_command, false);
+        assert_exe_discovery(&pathext(&std_command));
+
+        let mut tokio_command = Command::new("cmd.exe");
+        tokio_command.env_clear();
+        sanitized_base_environment(&mut tokio_command, false);
+        assert_exe_discovery(&pathext(tokio_command.as_std()));
     }
 
     #[test]

@@ -35,7 +35,7 @@ use crate::{
     error::{AppError, Result as AppResult},
     project::ProjectContext,
     request_context::ProjectRequestContext,
-    sandbox::{PathOperation, build_command_with_options},
+    sandbox::{PathOperation, build_command_with_options, hide_std_process_window},
 };
 
 const MIN_YIELD_MS: u64 = 250;
@@ -946,11 +946,13 @@ fn kill_tree(pid: Option<u32>) {
     }
     #[cfg(windows)]
     if let Some(pid) = pid {
-        let _ = std::process::Command::new("taskkill")
+        let mut command = std::process::Command::new("taskkill");
+        command
             .args(["/T", "/F", "/PID", &pid.to_string()])
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+            .stderr(std::process::Stdio::null());
+        hide_std_process_window(&mut command);
+        let _ = command.status();
     }
 }
 
@@ -979,6 +981,7 @@ fn signal_tree(pid: Option<u32>, signal: ProcessSignal) -> AppResult<()> {
         if matches!(signal, ProcessSignal::Kill) {
             command.arg("/F");
         }
+        hide_std_process_window(&mut command);
         let status = command
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

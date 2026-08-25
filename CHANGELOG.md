@@ -49,6 +49,7 @@ All notable changes to this project are documented here. The format follows Keep
 - Skill package resources accept an explicit `./` current-directory prefix while continuing to reject parent traversal, absolute forms, and backslash paths.
 
 ### Fixed
+- Windows background child processes now use `CREATE_NO_WINDOW`, preventing repeated cmd/PowerShell console popups from normal `exec_command`, runtime probes, `taskkill`, and stdio upstream MCP launches while leaving ConPTY-backed `tty=true` sessions interactive.
 - Windows shell classification now strips `.exe` case-insensitively (`cmd.Exe`, `PowerShell.Exe`, `pwsh.EXE`).
 - `read_file` no longer loses the remainder of a logical line that exceeds the presentation byte budget; oversized lines continue with a UTF-8-safe `line_byte_offset` cursor on the same line.
 - Project handover truncation now enforces its 48 KiB limit in UTF-8 bytes rather than Unicode scalar count and marks truncated excerpts explicitly.
