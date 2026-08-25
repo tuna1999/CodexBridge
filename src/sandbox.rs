@@ -1915,13 +1915,22 @@ mod tests {
     }
     #[test]
     fn exec_env_additions_reject_malformed_keys_and_oversized_values() {
-        let config = ConfigBuilder::from_map(BTreeMap::new()).build().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let config = ConfigBuilder::from_map(BTreeMap::from([
+            (
+                "WORKSPACE_ROOT".to_owned(),
+                directory.path().display().to_string(),
+            ),
+            ("MCP_AUTH_TOKEN".to_owned(), "1234567890abcdef".to_owned()),
+        ]))
+        .build()
+        .unwrap();
         let project = ProjectContext {
             native_project_key: ProjectKey::new("native".to_owned()).unwrap(),
             effective_project_key: ProjectKey::new("effective".to_owned()).unwrap(),
             project_alias: None,
-            project_root: std::env::temp_dir(),
-            metadata_root: std::env::temp_dir().join(".metadata"),
+            project_root: directory.path().to_path_buf(),
+            metadata_root: directory.path().join(".metadata"),
             transport_mode: crate::request_context::TransportMode::Stateless,
             mcp_session_present: false,
         };
