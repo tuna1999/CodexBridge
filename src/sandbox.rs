@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     path::{Component, Path, PathBuf},
     process::{Command as StdCommand, Stdio},
     sync::OnceLock,
@@ -840,22 +840,106 @@ fn windows_pathext() -> String {
         .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_owned())
 }
 
-fn sanitized_base_environment(command: &mut Command, use_bwrap: bool) {
-    if cfg!(windows) {
-        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
-        let path = std::env::var("PATH").unwrap_or_else(|_| {
-            format!(r"{system_root}\System32;{system_root};{system_root}\System32\WindowsPowerShell\v1.0")
-        });
-        let temporary = std::env::temp_dir();
-        command.env("PATH", path);
-        command.env("PATHEXT", windows_pathext());
-        command.env("SystemRoot", &system_root);
-        command.env("WINDIR", &system_root);
-        if let Ok(comspec) = std::env::var("ComSpec") {
-            command.env("ComSpec", comspec);
+fn non_empty_env_os(key: &str) -> Option<OsString> {
+    std::env::var_os(key).filter(|value| !value.is_empty())
+}
+
+fn sanitized_windows_environment() -> Vec<(OsString, OsString)> {
+    let system_root = non_empty_env_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+    let system_root_text = system_root.to_string_lossy();
+    let default_system_drive = if system_root_text.as_bytes().get(1) == Some(&b':') {
+        system_root_text[..2].to_owned()
+    } else {
+        "C:".to_owned()
+    };
+    let system_drive =
+        non_empty_env_os("SystemDrive").unwrap_or_else(|| OsString::from(default_system_drive));
+    let path = non_empty_env_os("PATH").unwrap_or_else(|| {
+        OsString::from(format!(
+            r"{}\System32;{};{}\System32\WindowsPowerShell\v1.0",
+            system_root_text, system_root_text, system_root_text
+        ))
+    });
+    let comspec = non_empty_env_os("ComSpec")
+        .unwrap_or_else(|| OsString::from(format!(r"{}\System32\cmd.exe", system_root_text)));
+    let temporary = std::env::temp_dir().into_os_string();
+    let program_data = non_empty_env_os("ProgramData").unwrap_or_else(|| {
+        OsString::from(format!(r"{}\ProgramData", system_drive.to_string_lossy()))
+    });
+
+    let mut environment = vec![
+        (OsString::from("PATH"), path),
+        (OsString::from("PATHEXT"), OsString::from(windows_pathext())),
+        (OsString::from("SystemRoot"), system_root.clone()),
+        (OsString::from("SystemDrive"), system_drive),
+        (OsString::from("WINDIR"), system_root),
+        (OsString::from("ComSpec"), comspec),
+        (OsString::from("ProgramData"), program_data),
+        (OsString::from("TEMP"), temporary.clone()),
+        (OsString::from("TMP"), temporary),
+    ];
+
+    // These variables describe the Windows user/profile layout and common native
+    // development toolchains. Preserve only this allow-list so env_clear still
+    // strips arbitrary credentials and unrelated parent-process state.
+    for key in [
+        "ALLUSERSPROFILE",
+        "APPDATA",
+        "CommonProgramFiles",
+        "CommonProgramFiles(x86)",
+        "CommonProgramW6432",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "LOCALAPPDATA",
+        "OS",
+        "PROCESSOR_ARCHITECTURE",
+        "PROCESSOR_IDENTIFIER",
+        "PROCESSOR_LEVEL",
+        "PROCESSOR_REVISION",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
+        "PSModulePath",
+        "PUBLIC",
+        "USERDOMAIN",
+        "USERNAME",
+        "USERPROFILE",
+        "DevEnvDir",
+        "FrameworkDir",
+        "FrameworkVersion",
+        "INCLUDE",
+        "LIB",
+        "LIBPATH",
+        "UniversalCRTSdkDir",
+        "UCRTVersion",
+        "VCINSTALLDIR",
+        "VCToolsInstallDir",
+        "VSINSTALLDIR",
+        "WindowsSdkDir",
+        "WindowsSDKVersion",
+    ] {
+        if let Some(value) = non_empty_env_os(key) {
+            environment.push((OsString::from(key), value));
         }
-        command.env("TEMP", &temporary);
-        command.env("TMP", &temporary);
+    }
+
+    for (key, value) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("VSCMD_")
+            && !value.is_empty()
+        {
+            environment.push((key, value));
+        }
+    }
+
+    environment
+}
+
+pub(crate) fn sanitized_base_environment(command: &mut Command, use_bwrap: bool) {
+    if cfg!(windows) {
+        command.envs(sanitized_windows_environment());
     } else {
         let path = if use_bwrap {
             "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned()
@@ -1300,14 +1384,7 @@ fn bubblewrap_base_std_command(
 
 fn sanitized_base_std_environment(command: &mut StdCommand, use_bwrap: bool) {
     if cfg!(windows) {
-        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
-        let path = std::env::var("PATH").unwrap_or_else(|_| {
-            format!(r"{system_root}\System32;{system_root};{system_root}\System32\WindowsPowerShell\v1.0")
-        });
-        command.env("PATH", path);
-        command.env("PATHEXT", windows_pathext());
-        command.env("SystemRoot", &system_root);
-        command.env("WINDIR", &system_root);
+        command.envs(sanitized_windows_environment());
     } else {
         let path = if use_bwrap {
             "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned()
@@ -2027,36 +2104,53 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn sanitized_windows_environment_restores_pathext_for_command_discovery() {
-        let pathext = |command: &StdCommand| {
+    fn sanitized_windows_environment_restores_required_system_context() {
+        let env_value = |command: &StdCommand, name: &str| {
             command
-            .get_envs()
-            .find_map(|(key, value)| {
-                key.to_string_lossy()
-                    .eq_ignore_ascii_case("PATHEXT")
-                    .then(|| value.map(|value| value.to_string_lossy().into_owned()))
-                    .flatten()
-            })
-            .expect("PATHEXT must be restored after env_clear on Windows")
+                .get_envs()
+                .find_map(|(key, value)| {
+                    key.to_string_lossy()
+                        .eq_ignore_ascii_case(name)
+                        .then(|| value.map(|value| value.to_string_lossy().into_owned()))
+                        .flatten()
+                })
+                .unwrap_or_else(|| panic!("{name} must be restored after env_clear on Windows"))
         };
-        let assert_exe_discovery = |value: &str| {
+        let assert_required_environment = |command: &StdCommand| {
+            let pathext = env_value(command, "PATHEXT");
             assert!(
-                value
+                pathext
                     .split(';')
                     .any(|extension| extension.eq_ignore_ascii_case(".EXE")),
                 "PATHEXT must include .EXE so PowerShell can resolve native commands"
             );
+            let system_drive = env_value(command, "SystemDrive");
+            assert!(
+                system_drive.ends_with(':'),
+                "SystemDrive must resolve to a drive designator, got {system_drive:?}"
+            );
+            let program_data = env_value(command, "ProgramData");
+            assert!(
+                !program_data.contains('%'),
+                "ProgramData must be an expanded path, got {program_data:?}"
+            );
+            for key in ["PATH", "SystemRoot", "WINDIR", "ComSpec", "TEMP", "TMP"] {
+                assert!(
+                    !env_value(command, key).is_empty(),
+                    "{key} must not be empty"
+                );
+            }
         };
 
         let mut std_command = StdCommand::new("cmd.exe");
         std_command.env_clear();
         sanitized_base_std_environment(&mut std_command, false);
-        assert_exe_discovery(&pathext(&std_command));
+        assert_required_environment(&std_command);
 
         let mut tokio_command = Command::new("cmd.exe");
         tokio_command.env_clear();
         sanitized_base_environment(&mut tokio_command, false);
-        assert_exe_discovery(&pathext(tokio_command.as_std()));
+        assert_required_environment(tokio_command.as_std());
     }
 
     #[test]

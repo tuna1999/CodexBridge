@@ -26,7 +26,7 @@ use crate::{
     config::{Config, UpstreamMode},
     error::AppError,
     request_context::identity_from_request,
-    sandbox::hide_tokio_process_window,
+    sandbox::{hide_tokio_process_window, sanitized_base_environment},
     tools::{AgentHandler, error_result},
 };
 
@@ -542,10 +542,8 @@ pub async fn connect_upstreams(config: &Config) -> ConnectedUpstreams {
                     continue;
                 };
                 let mut command = Command::new(command_path);
-                command.args(&spec.args).env_clear().envs([
-                    ("PATH", "/usr/local/bin:/usr/bin:/bin"),
-                    ("LANG", "C.UTF-8"),
-                ]);
+                command.args(&spec.args).env_clear();
+                sanitized_base_environment(&mut command, false);
                 command.envs(&spec.env);
                 hide_tokio_process_window(&mut command);
                 let transport = match TokioChildProcess::new(command) {
