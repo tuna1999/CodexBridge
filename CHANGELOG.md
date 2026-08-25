@@ -49,6 +49,7 @@ All notable changes to this project are documented here. The format follows Keep
 - Skill package resources accept an explicit `./` current-directory prefix while continuing to reject parent traversal, absolute forms, and backslash paths.
 
 ### Fixed
+- Windows bare shell names are now canonicalized before spawn (`cmd`/`cmd.exe` via a valid `ComSpec`, plus `powershell.exe`/`pwsh.exe`), with native and ConPTY regression coverage and a dedicated Windows CI job.
 - Windows sanitized child environments now preserve required system/profile variables (including `SystemDrive`, `ProgramData`, `ComSpec`, user paths, and MSVC/Windows SDK context), preventing literal `%SystemDrive%` cache trees from being created under a project's working directory; stdio upstream MCP processes now use the same platform-aware baseline instead of a Unix-only `PATH`.
 - Windows background child processes now use `CREATE_NO_WINDOW`, preventing repeated cmd/PowerShell console popups from normal `exec_command`, runtime probes, `taskkill`, and stdio upstream MCP launches while leaving ConPTY-backed `tty=true` sessions interactive.
 - Windows shell classification now strips `.exe` case-insensitively (`cmd.Exe`, `PowerShell.Exe`, `pwsh.EXE`).
