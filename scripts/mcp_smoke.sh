@@ -76,6 +76,7 @@ curl -sS -D "$run_root/modern-init.headers" "${modern_headers[@]}" \
   "$endpoint" >"$run_root/modern-init.json"
 ! grep -qi '^mcp-session-id:' "$run_root/modern-init.headers"
 grep -q 'CodexBridge' "$run_root/modern-init.json"
+grep -Eq '"version":"[^"]+\+contract\.[0-9a-f]{12}"' "$run_root/modern-init.json"
 grep -q 'first project-bearing turn' "$run_root/modern-init.json"
 grep -q 'chatgpt_turn_init' "$run_root/modern-init.json"
 grep -q 'exactly once' "$run_root/modern-init.json"
@@ -111,9 +112,9 @@ jq -e --argjson expected "$expected_tools" '(.result.tools | map(.name) | sort) 
 jq -e '.result.tools[] | select(.name == "chatgpt_turn_init") | (.description | contains("idempotent")) and (.inputSchema.properties.previous_turn_ref.type == ["string","null"]) and (.outputSchema.properties.turn_ref.type == "string") and (.outputSchema.properties.previous_turn_ref.type == ["string","null"]) and (.outputSchema.properties.instruction_hash.type == "string") and (.outputSchema.properties.state_hash.type == "string") and (.outputSchema.properties.instructions_changed.type == "boolean") and (.outputSchema.properties.state_changed.type == "boolean") and (.outputSchema.properties.turn_reused.type == "boolean") and (.outputSchema.properties.brief.type == ["string","null"]) and (.outputSchema.properties.state_update.type == ["string","null"])' "$run_root/tools.json" >/dev/null
 jq -e '.result.tools[] | select(.name == "skills_list") | .inputSchema.properties.path.type == ["string","null"]' "$run_root/tools.json" >/dev/null
 jq -e '.result.tools[] | select(.name == "skills_read") | .inputSchema.properties.path.type == ["string","null"]' "$run_root/tools.json" >/dev/null
-jq -e '.result.tools[] | select(.name == "recall") | .inputSchema.properties.offset.type == "integer" and .inputSchema.properties.max_results.type == ["integer","null"] and .inputSchema.properties.snapshot_hash.type == ["string","null"] and .inputSchema.properties.include_plan.type == "boolean"' "$run_root/tools.json" >/dev/null
-jq -e '.result.tools[] | select(.name == "exec_command") | .inputSchema.properties.stdin.type == ["string","null"] and .inputSchema.properties.close_stdin.type == "boolean"' "$run_root/tools.json" >/dev/null
-jq -e '.result.tools[] | select(.name == "write_stdin") | .inputSchema.properties.since_output_offset.type == ["integer","null"] and .inputSchema.properties.wait_for_exit_ms.type == ["integer","null"]' "$run_root/tools.json" >/dev/null
+jq -e '.result.tools[] | select(.name == "recall") | .inputSchema.properties.offset.type == "integer" and .inputSchema.properties.max_results.type == ["integer","null"] and .inputSchema.properties.snapshot_hash.type == ["string","null"] and .inputSchema.properties.include_plan.type == "boolean" and .inputSchema.properties.extensions.type == "object" and .inputSchema.properties.extensions.additionalProperties != false and ((.inputSchema.required // []) | index("extensions") | not)' "$run_root/tools.json" >/dev/null
+jq -e '.result.tools[] | select(.name == "exec_command") | .inputSchema.properties.stdin.type == ["string","null"] and .inputSchema.properties.close_stdin.type == "boolean" and .inputSchema.properties.extensions.type == "object" and .inputSchema.properties.extensions.additionalProperties != false and ((.inputSchema.required // []) | index("extensions") | not)' "$run_root/tools.json" >/dev/null
+jq -e '.result.tools[] | select(.name == "write_stdin") | .inputSchema.properties.since_output_offset.type == ["integer","null"] and .inputSchema.properties.wait_for_exit_ms.type == ["integer","null"] and .inputSchema.properties.extensions.type == "object" and .inputSchema.properties.extensions.additionalProperties != false and ((.inputSchema.required // []) | index("extensions") | not)' "$run_root/tools.json" >/dev/null
 jq -e '.result.tools[] | select(.name == "remember") | (.description | contains("costly to rediscover")) and (.description | contains("memory_set") | not)' "$run_root/tools.json" >/dev/null
 jq -e '.result.tools[] | select(.name == "grep") | .outputSchema.properties.incomplete.type == "boolean" and .outputSchema.properties.skipped_files.type == "integer" and .outputSchema.properties.traversal_limit_hit.type == "boolean"' "$run_root/tools.json" >/dev/null
 jq -e '.result.tools[] | select(.name == "exec_command") | (.description | contains("Shell:")) and (.description | contains("Default backend:"))' "$run_root/tools.json" >/dev/null
@@ -546,6 +547,19 @@ grep -q 'got:hello' "$run_root/stdin.json"
 call_tool exec_command 1008 '{"cmd":"cat","stdin":"SUBAGENT_EOF_OK\n","close_stdin":true,"yield_time_ms":5000}' "$run_root/oneshot-stdin-eof.json"
 jq -e '.result.structuredContent.exit_code == 0 and .result.structuredContent.completion_reason == "exited" and .result.structuredContent.session_id == null' "$run_root/oneshot-stdin-eof.json" >/dev/null
 grep -q 'SUBAGENT_EOF_OK' "$run_root/oneshot-stdin-eof.json"
+call_tool exec_command 1016 '{"cmd":"cat","extensions":{"stdin":"EXTENSION_EOF_OK\n","close_stdin":true},"yield_time_ms":5000}' "$run_root/extension-stdin-eof.json"
+jq -e '.result.structuredContent.exit_code == 0 and .result.structuredContent.completion_reason == "exited"' "$run_root/extension-stdin-eof.json" >/dev/null
+grep -q 'EXTENSION_EOF_OK' "$run_root/extension-stdin-eof.json"
+call_tool exec_command 1017 '{"cmd":"printf UNKNOWN_EXTENSION_OK","extensions":{"future_option":{"nested":true}},"yield_time_ms":5000}' "$run_root/unknown-extension.json"
+jq -e '.result.structuredContent.exit_code == 0 and .result.structuredContent.completion_reason == "exited"' "$run_root/unknown-extension.json" >/dev/null
+grep -q 'UNKNOWN_EXTENSION_OK' "$run_root/unknown-extension.json"
+call_tool exec_command 1018 '{"cmd":"cat","stdin":"TYPED_EXTENSION_PRECEDENCE\n","close_stdin":true,"extensions":{"stdin":123,"close_stdin":"invalid"},"yield_time_ms":5000}' "$run_root/typed-extension-precedence.json"
+jq -e '.result.structuredContent.exit_code == 0 and .result.structuredContent.completion_reason == "exited"' "$run_root/typed-extension-precedence.json" >/dev/null
+grep -q 'TYPED_EXTENSION_PRECEDENCE' "$run_root/typed-extension-precedence.json"
+call_tool exec_command 1019 '{"cmd":"cat","extensions":{"stdin":123},"yield_time_ms":5000}' "$run_root/invalid-exec-extension.json"
+jq -e '.result.isError == true and (.result.content[0].text | startswith("INVALID_INPUT:"))' "$run_root/invalid-exec-extension.json" >/dev/null
+call_tool write_stdin 1020 '{"session_id":"missing-session","extensions":{"wait_for_exit_ms":"invalid"}}' "$run_root/invalid-stdin-extension.json"
+jq -e '.result.isError == true and (.result.content[0].text | startswith("INVALID_INPUT:"))' "$run_root/invalid-stdin-extension.json" >/dev/null
 call_tool exec_command 1007 '{"cmd":"limit=$(ulimit -u 2>/dev/null || printf unsupported); if [ \"$limit\" = 128 ]; then printf NPROC_BAD:%s \"$limit\"; exit 99; fi; printf NPROC_OK:%s \"$limit\"","yield_time_ms":5000}' "$run_root/nproc-limit.json"
 jq -e '.result.structuredContent.exit_code == 0' "$run_root/nproc-limit.json" >/dev/null
 grep -q 'NPROC_OK:' "$run_root/nproc-limit.json"
@@ -571,8 +585,10 @@ jq -e '.result.structuredContent.output == "CHUNK_A_" and .result.structuredCont
 sleep 1.5
 call_tool write_stdin 1014 "$(jq -cn --arg id "$chunk_session" '{session_id:$id}')" "$run_root/chunk-rest.json"
 jq -e '.result.structuredContent.completion_reason == "exited" and .result.structuredContent.output == "CHUNK_B" and .result.structuredContent.output_offset == 8 and .result.structuredContent.output_next_offset == 15' "$run_root/chunk-rest.json" >/dev/null
-call_tool write_stdin 1015 "$(jq -cn --arg id "$chunk_session" '{session_id:$id,since_output_offset:0}')" "$run_root/chunk-replay.json"
+call_tool write_stdin 1015 "$(jq -cn --arg id "$chunk_session" '{session_id:$id,extensions:{since_output_offset:0}}')" "$run_root/chunk-replay.json"
 jq -e '.result.structuredContent.completion_reason == "exited" and .result.structuredContent.output == "CHUNK_A_CHUNK_B" and .result.structuredContent.output_offset == 0' "$run_root/chunk-replay.json" >/dev/null
+call_tool write_stdin 1021 "$(jq -cn --arg id "$chunk_session" '{session_id:$id,since_output_offset:0,extensions:{since_output_offset:"invalid"}}')" "$run_root/chunk-typed-precedence.json"
+jq -e '.result.structuredContent.completion_reason == "exited" and .result.structuredContent.output == "CHUNK_A_CHUNK_B" and .result.structuredContent.output_offset == 0' "$run_root/chunk-typed-precedence.json" >/dev/null
 
 # Real PTY path: allocate a terminal, verify the session is interactive, resize
 # it while sending input, and collect the rendered terminal snapshot.
@@ -589,7 +605,7 @@ grep -q 'PTY_GOT:hello' "$run_root/pty-finish.json"
 call_tool exec_command 111 '{"cmd":"sleep 30","yield_time_ms":250,"timeout_ms":10000}' "$run_root/signal-start.json"
 signal_session="$(jq -r '.result.structuredContent.session_id // empty' "$run_root/signal-start.json")"
 [[ -n "$signal_session" ]]
-call_tool write_stdin 112 "$(jq -cn --arg id "$signal_session" '{session_id:$id,signal:"interrupt",wait_for_exit_ms:5000}')" "$run_root/signal-finish.json"
+call_tool write_stdin 112 "$(jq -cn --arg id "$signal_session" '{session_id:$id,signal:"interrupt",extensions:{wait_for_exit_ms:5000}}')" "$run_root/signal-finish.json"
 jq -e '.result.structuredContent.completion_reason == "signaled" and .result.structuredContent.requested_signal == "interrupt" and .result.structuredContent.timed_out == false and .result.structuredContent.session_id == null and (.result.structuredContent.exit_code == null or .result.structuredContent.exit_code >= 0)' "$run_root/signal-finish.json" >/dev/null
 
 # Graceful shutdown can be evidenced in one lifecycle call: deliver SIGTERM,
@@ -641,8 +657,16 @@ call_tool remember 102 '{"key":"gamma","value":"three"}' "$run_root/remember-gam
 call_tool recall 103 '{"max_results":2,"include_plan":true}' "$run_root/recall-page-1.json"
 jq -e '.result.structuredContent.notes | length == 2' "$run_root/recall-page-1.json" >/dev/null
 jq -e '.result.structuredContent.truncated == true and .result.structuredContent.next_offset == 2 and (.result.structuredContent.plan.items[0].step == "smoke") and (.result.structuredContent.continuation | contains("offset=2"))' "$run_root/recall-page-1.json" >/dev/null
-call_tool recall 104 '{"offset":2,"max_results":2,"include_plan":true}' "$run_root/recall-page-2.json"
+recall_snapshot_hash="$(jq -r '.result.structuredContent.snapshot_hash' "$run_root/recall-page-1.json")"
+call_tool recall 107 "$(jq -cn --arg hash "$recall_snapshot_hash" '{offset:2,max_results:2,snapshot_hash:$hash,extensions:{snapshot_hash:123}}')" "$run_root/recall-typed-precedence.json"
+jq -e '.result.isError != true and .result.structuredContent.offset == 2 and (.result.structuredContent.notes | length) >= 1' "$run_root/recall-typed-precedence.json" >/dev/null
+call_tool recall 108 '{"offset":2,"max_results":2,"extensions":{"snapshot_hash":123}}' "$run_root/recall-invalid-extension.json"
+jq -e '.result.isError == true and (.result.content[0].text | startswith("INVALID_INPUT:"))' "$run_root/recall-invalid-extension.json" >/dev/null
+call_tool recall 104 "$(jq -cn --arg hash "$recall_snapshot_hash" '{offset:2,max_results:2,include_plan:true,extensions:{snapshot_hash:$hash}}')" "$run_root/recall-page-2.json"
 jq -e '.result.structuredContent.offset == 2 and (.result.structuredContent.notes | length) >= 1 and (.result.structuredContent.plan.items[0].status == "completed")' "$run_root/recall-page-2.json" >/dev/null
+call_tool remember 105 '{"key":"delta","value":"four"}' "$run_root/remember-delta.json"
+call_tool recall 106 "$(jq -cn --arg hash "$recall_snapshot_hash" '{offset:2,max_results:2,extensions:{snapshot_hash:$hash}}')" "$run_root/recall-stale.json"
+jq -e '.result.isError == true and (.result.content[0].text | startswith("PAGINATION_STALE:"))' "$run_root/recall-stale.json" >/dev/null
 
 # Keep an interactive process live while the daemon receives SIGTERM. The
 # daemon shutdown path must terminate it, wait for its process/drain tasks, and

@@ -48,6 +48,57 @@ use contracts::typed_output_schema;
 use process::ProcessRegistry;
 use registry::NativeToolRegistry;
 
+pub(crate) fn extension_arg<T>(
+    extensions: &std::collections::BTreeMap<String, Value>,
+    key: &str,
+) -> AppResult<Option<T>>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let Some(value) = extensions.get(key) else {
+        return Ok(None);
+    };
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|_| {
+            AppError::new(
+                "INVALID_INPUT",
+                format!("extensions.{key} has an invalid value"),
+            )
+        })
+}
+
+fn tool_contract_hash(router: &ToolRouter<AgentHandler>) -> String {
+    let mut routes = router.map.iter().collect::<Vec<_>>();
+    routes.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let mut hasher = Sha256::new();
+    hasher.update(b"codexbridge-tool-contract-v1\0");
+    for (name, route) in routes {
+        hasher.update(name.as_bytes());
+        hasher.update([0]);
+        if let Some(description) = route.attr.description.as_deref() {
+            hasher.update(description.as_bytes());
+        }
+        hasher.update([0]);
+        if let Ok(input) = serde_json::to_vec(route.attr.input_schema.as_ref()) {
+            hasher.update(input);
+        }
+        hasher.update([0]);
+        if let Some(output_schema) = route.attr.output_schema.as_ref()
+            && let Ok(output) = serde_json::to_vec(output_schema.as_ref())
+        {
+            hasher.update(output);
+        }
+        hasher.update([0xff]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn server_contract_version(router: &ToolRouter<AgentHandler>) -> String {
+    let hash = tool_contract_hash(router);
+    format!("{}+contract.{}", env!("CARGO_PKG_VERSION"), &hash[..12])
+}
+
 const INSTRUCTION_SCOPE_CACHE_MAX_ENTRIES: usize = 4096;
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -817,7 +868,7 @@ impl ServerHandler for AgentHandler {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 "CodexBridge",
-                env!("CARGO_PKG_VERSION"),
+                server_contract_version(&self.tool_router),
             ))
             .with_instructions(agent::pre_init_instructions(
                 &self.shared.config,
@@ -1412,6 +1463,100 @@ mod tests {
         assert_eq!(output["turn_reused"]["type"], json!("boolean"));
         assert_eq!(output["brief"]["type"], json!(["string", "null"]));
         assert_eq!(output["state_update"]["type"], json!(["string", "null"]));
+    }
+
+    #[test]
+    fn forward_compatible_extension_envelopes_are_advertised() {
+        let router = AgentHandler::native_router();
+        for name in ["exec_command", "write_stdin", "recall"] {
+            let schema = &router.map[name].attr.input_schema;
+            let properties = schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .unwrap_or_else(|| panic!("missing input properties for {name}"));
+            let extensions = properties
+                .get("extensions")
+                .unwrap_or_else(|| panic!("missing extensions schema for {name}"));
+            assert_eq!(extensions.get("type"), Some(&json!("object")));
+            assert!(
+                extensions
+                    .get("additionalProperties")
+                    .is_some_and(|value| value != &json!(false)),
+                "extensions for {name} must stay open for forward compatibility"
+            );
+            assert!(
+                !schema
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .is_some_and(|required| required.iter().any(|key| key == "extensions")),
+                "extensions for {name} must remain optional"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_contract_hash_is_deterministic_and_changes_with_contract_metadata() {
+        let router = AgentHandler::native_router();
+        let before = tool_contract_hash(&router);
+        assert_eq!(before, tool_contract_hash(&router));
+        assert_eq!(before, tool_contract_hash(&AgentHandler::native_router()));
+        assert_eq!(before.len(), 64);
+
+        let mut description_router = AgentHandler::native_router();
+        description_router
+            .map
+            .get_mut("recall")
+            .unwrap()
+            .attr
+            .description = Some(Cow::Borrowed("contract changed"));
+        assert_ne!(before, tool_contract_hash(&description_router));
+
+        let mut name_router = AgentHandler::native_router();
+        let recall = name_router.map.remove("recall").unwrap();
+        name_router
+            .map
+            .insert("recall_changed".to_owned().into(), recall);
+        assert_ne!(before, tool_contract_hash(&name_router));
+
+        let mut input_router = AgentHandler::native_router();
+        let input_route = input_router.map.get_mut("recall").unwrap();
+        let mut input_schema = input_route.attr.input_schema.as_ref().clone();
+        input_schema.insert("x-contract-test".to_owned(), json!(true));
+        input_route.attr.input_schema = Arc::new(input_schema);
+        assert_ne!(before, tool_contract_hash(&input_router));
+
+        let mut output_router = AgentHandler::native_router();
+        let output_route = output_router.map.get_mut("recall").unwrap();
+        let mut output_schema = output_route
+            .attr
+            .output_schema
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .clone();
+        output_schema.insert("x-contract-test".to_owned(), json!(true));
+        output_route.attr.output_schema = Some(Arc::new(output_schema));
+        assert_ne!(before, tool_contract_hash(&output_router));
+    }
+
+    #[test]
+    fn server_contract_version_embeds_current_contract_hash_prefix() {
+        let router = AgentHandler::native_router();
+        let hash = tool_contract_hash(&router);
+        let version = server_contract_version(&router);
+        assert_eq!(
+            version,
+            format!("{}+contract.{}", env!("CARGO_PKG_VERSION"), &hash[..12])
+        );
+
+        let mut changed_router = AgentHandler::native_router();
+        changed_router
+            .map
+            .get_mut("recall")
+            .unwrap()
+            .attr
+            .description = Some(Cow::Borrowed("different contract"));
+        assert_ne!(version, server_contract_version(&changed_router));
     }
 
     #[test]

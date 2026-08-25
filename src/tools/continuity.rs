@@ -1,9 +1,11 @@
+use std::collections::BTreeMap;
+
 use rmcp::{
     ErrorData, handler::server::wrapper::Parameters, model::CallToolResult, tool, tool_router,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::AgentHandler;
 use crate::{
@@ -33,6 +35,18 @@ pub struct RecallArgs {
     pub snapshot_hash: Option<String>,
     #[serde(default)]
     pub include_plan: bool,
+    /// Forward-compatible optional arguments. Typed top-level fields remain preferred;
+    /// newer servers may consume additional keys here without requiring clients to
+    /// refresh their top-level tool schema first.
+    #[serde(default)]
+    pub extensions: BTreeMap<String, Value>,
+}
+
+fn effective_snapshot_hash(args: &RecallArgs) -> AppResult<Option<String>> {
+    if let Some(snapshot_hash) = args.snapshot_hash.as_ref() {
+        return Ok(Some(snapshot_hash.clone()));
+    }
+    super::extension_arg(&args.extensions, "snapshot_hash")
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -111,7 +125,7 @@ impl AgentHandler {
     }
 
     #[tool(
-        description = "Read project-scoped working state. With key, return one memory note. Without key, return a bounded lexicographically sorted memory page using offset/max_results. The first page also returns snapshot_hash; pass that exact hash with every next_offset continuation so concurrent memory changes fail with PAGINATION_STALE instead of silently repeating/skipping notes. On PAGINATION_STALE, restart enumeration from offset=0 without the old snapshot hash. Set include_plan=true to include the complete persisted plan."
+        description = "Read project-scoped working state. With key, return one memory note. Without key, return a bounded lexicographically sorted memory page using offset/max_results. The first page also returns snapshot_hash; pass that exact hash with every next_offset continuation so concurrent memory changes fail with PAGINATION_STALE instead of silently repeating/skipping notes. snapshot_hash and future optional arguments may also be supplied under extensions; typed top-level fields remain preferred. On PAGINATION_STALE, restart enumeration from offset=0 without the old snapshot hash. Set include_plan=true to include the complete persisted plan."
     )]
     async fn recall(
         &self,
@@ -119,6 +133,10 @@ impl AgentHandler {
         Parameters(args): Parameters<RecallArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let storage = self.shared.storage.clone();
+        let snapshot_hash = match effective_snapshot_hash(&args) {
+            Ok(snapshot_hash) => snapshot_hash,
+            Err(error) => return Ok(super::error_result(&error)),
+        };
         let params = serde_json::to_value(&args).unwrap_or_default();
         self.run(context.0, "recall", params, move |project| async move {
             let project_key = project.effective_project_key.as_str();
@@ -134,7 +152,7 @@ impl AgentHandler {
                 project_key,
                 args.offset,
                 args.max_results.unwrap_or(crate::storage::MEMORY_RECALL_MAX_ENTRIES),
-                args.snapshot_hash.as_deref(),
+                snapshot_hash.as_deref(),
             )?;
             let mut value = serde_json::to_value(page).unwrap_or_default();
             if let Some(object) = value.as_object_mut() {
@@ -236,6 +254,45 @@ impl AgentHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recall_snapshot_hash_extensions_fallback_and_typed_value_precedence() {
+        let extension_only: RecallArgs = serde_json::from_value(json!({
+            "extensions":{"snapshot_hash":"extension-hash"}
+        }))
+        .unwrap();
+        assert_eq!(
+            effective_snapshot_hash(&extension_only).unwrap().as_deref(),
+            Some("extension-hash")
+        );
+
+        let typed: RecallArgs = serde_json::from_value(json!({
+            "snapshot_hash":"typed-hash",
+            "extensions":{"snapshot_hash":123,"future_cursor":{"opaque":true}}
+        }))
+        .unwrap();
+        assert_eq!(
+            effective_snapshot_hash(&typed).unwrap().as_deref(),
+            Some("typed-hash")
+        );
+
+        let unknown_only: RecallArgs = serde_json::from_value(json!({
+            "extensions":{"future_cursor":{"opaque":true}}
+        }))
+        .unwrap();
+        assert_eq!(effective_snapshot_hash(&unknown_only).unwrap(), None);
+    }
+
+    #[test]
+    fn recall_snapshot_hash_extension_rejects_invalid_type() {
+        let args: RecallArgs = serde_json::from_value(json!({
+            "extensions":{"snapshot_hash":123}
+        }))
+        .unwrap();
+        let error = effective_snapshot_hash(&args).unwrap_err();
+        assert_eq!(error.code(), "INVALID_INPUT");
+        assert!(error.message().contains("extensions.snapshot_hash"));
+    }
 
     #[tokio::test]
     async fn regression_public_update_plan_empty_plan_clears_persisted_plan() {

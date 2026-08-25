@@ -92,6 +92,10 @@ CodexBridge exposes exactly 15 native tools:
 
 There are no public native `exec`/`run_command`, duplicate memory/plan CRUD tools, task CRUD tools, clock tools, Git wrappers, or download helpers. Use `exec_command` for Git, package managers, downloads, container engines, and other commands that do not need their own structured tool. Configured upstream MCP tools are additive and are described below; with no upstream config the exposed surface is exactly the 15 native tools above.
 
+`exec_command`, `write_stdin`, and `recall` also expose an optional open `extensions` object for forward-compatible optional arguments. Typed top-level fields remain the primary contract and take precedence when present. If a supported top-level value is absent, the runtime can consume its equivalent extension key; currently this includes `exec_command.stdin` / `close_stdin`, `write_stdin.since_output_offset` / `wait_for_exit_ms` / `close_stdin`, and `recall.snapshot_hash`. Unknown extension keys are ignored so a newer server can introduce optional capabilities without requiring an immediate top-level schema refresh. A known extension key with an invalid value fails with `INVALID_INPUT`. Clients still need to discover the `extensions` envelope itself at least once before relying on that compatibility path.
+
+The MCP `serverInfo.version` is contract-qualified as `<package-version>+contract.<12-hex>`. The fingerprint is deterministic over the exposed tool names, descriptions, input schemas, and output schemas, so a public tool-contract change changes the advertised server version even when the Cargo package version is unchanged. This is a discovery/cache-invalidation signal for clients and operators, not a guarantee that every external connector will automatically refresh cached metadata.
+
 ## Optional upstream MCP aggregation
 
 Upstreams are disabled by default. Set `MCP_UPSTREAM_CONFIG` to a bounded YAML or JSON file when the daemon should connect to operator-approved MCP servers. The file uses the familiar `mcpServers` shape:
@@ -353,20 +357,22 @@ SIGTERM/SIGINT triggers graceful HTTP shutdown, process cleanup, legacy-session 
 
 ```bash
 cargo fmt --check
-cargo check --all-targets --all-features
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 cargo build --bins --examples
+bash -n scripts/mcp_smoke.sh
+git diff --check
 scripts/mcp_smoke.sh
 ```
 
-CI runs format/check/tests on Linux, macOS, and Windows and runs Clippy plus the real MCP HTTP smoke suite on Linux. The smoke suite also launches deterministic stdio upstreams and verifies both direct forwarding and gateway dispatch/progressive skill disclosure. Release tags build `codex-bridge` archives for Linux x86-64/ARM64, macOS Apple Silicon/Intel, and Windows x86-64 with SHA256 checksums.
+CI currently runs on Ubuntu and executes formatting, Clippy, the full Rust test suite, bin/example builds, smoke-script syntax validation, whitespace validation, and the real MCP HTTP smoke suite. The smoke suite also launches deterministic stdio upstreams and verifies both direct forwarding and gateway dispatch/progressive skill disclosure. The manual release workflow builds raw `codex-bridge` binaries for Linux x86-64, Linux ARM64, macOS Apple Silicon, and Windows x86-64.
 
 ## Known boundaries
 
 - Normal project filesystem confinement is strongest on Unix where descriptor-relative no-follow APIs are available; non-Unix implementations rely more heavily on canonical validation.
 - Multi-file patch rollback covers failures observed during the call but is not crash-atomic across sudden power/process failure.
 - Legacy RMCP transport sessions are in-memory and do not survive restart; project bindings/files/memory/plans do.
+- External MCP clients/connectors may cache model-facing tool metadata independently of the running CodexBridge server. The deployed server's `tools/list` response is the canonical contract. The contract-qualified `serverInfo.version` provides a change signal and the open `extensions` envelope reduces dependence on future top-level schema additions, but CodexBridge cannot force an external connector to invalidate an already cached schema. A connector that has not yet discovered `extensions`, or that needs a newly added top-level field, may require re-discovery or reconnection.
 - The transport does not supply a trustworthy ChatGPT user-message ID. A lost response to the very first `chatgpt_turn_init` cannot be replayed from a client idempotency key that does not exist; later duplicate continuations are deterministic through `previous_turn_ref`.
 - `recall` pagination detects concurrent note mutations with `snapshot_hash`, but it does not retain historical memory snapshots. A `PAGINATION_STALE` continuation must restart enumeration from offset 0 against the new snapshot.
 - Process output retention is bounded. Once the middle of a long stdout/stderr stream is evicted from the head+tail buffer, those omitted bytes cannot be reconstructed; replay reports the gap explicitly instead of fabricating a contiguous byte range. Commands that require a complete durable log should write that log to a project file or another durable sink.

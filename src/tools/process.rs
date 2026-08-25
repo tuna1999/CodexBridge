@@ -78,6 +78,11 @@ pub struct ExecCommandArgs {
     pub rows: Option<u16>,
     #[serde(default)]
     pub cols: Option<u16>,
+    /// Forward-compatible optional arguments. Typed top-level fields remain preferred;
+    /// newer servers may consume additional keys here without requiring clients to
+    /// refresh their top-level tool schema first.
+    #[serde(default)]
+    pub extensions: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -112,6 +117,46 @@ pub struct WriteStdinArgs {
     /// input/EOF/signal action, draining final output in the same tool call.
     #[serde(default)]
     pub wait_for_exit_ms: Option<u64>,
+    /// Forward-compatible optional arguments. Typed top-level fields remain preferred;
+    /// newer servers may consume additional keys here without requiring clients to
+    /// refresh their top-level tool schema first.
+    #[serde(default)]
+    pub extensions: BTreeMap<String, Value>,
+}
+
+fn effective_exec_stdin(args: &ExecCommandArgs) -> AppResult<Option<String>> {
+    if let Some(stdin) = args.stdin.as_ref() {
+        return Ok(Some(stdin.clone()));
+    }
+    super::extension_arg(&args.extensions, "stdin")
+}
+
+fn effective_exec_close_stdin(args: &ExecCommandArgs) -> AppResult<bool> {
+    if args.close_stdin {
+        return Ok(true);
+    }
+    Ok(super::extension_arg::<bool>(&args.extensions, "close_stdin")?.unwrap_or(false))
+}
+
+fn effective_since_output_offset(args: &WriteStdinArgs) -> AppResult<Option<usize>> {
+    if args.since_output_offset.is_some() {
+        return Ok(args.since_output_offset);
+    }
+    super::extension_arg(&args.extensions, "since_output_offset")
+}
+
+fn effective_wait_for_exit_ms(args: &WriteStdinArgs) -> AppResult<Option<u64>> {
+    if args.wait_for_exit_ms.is_some() {
+        return Ok(args.wait_for_exit_ms);
+    }
+    super::extension_arg(&args.extensions, "wait_for_exit_ms")
+}
+
+fn effective_write_close_stdin(args: &WriteStdinArgs) -> AppResult<bool> {
+    if args.close_stdin {
+        return Ok(true);
+    }
+    Ok(super::extension_arg::<bool>(&args.extensions, "close_stdin")?.unwrap_or(false))
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
@@ -1043,7 +1088,7 @@ async fn yield_result(
 #[tool_router(router = process_router, vis = "pub(crate)")]
 impl AgentHandler {
     #[tool(
-        description = "Start a bounded command with a project-relative working directory. The effective execution backend may be Bubblewrap or native YOLO; native execution is not OS-filesystem-confined. Returns immediately when it exits, otherwise returns a project-scoped session_id for write_stdin. For one-shot CLIs or subagents that may read until EOF, pass optional stdin and close_stdin=true. Set tty=true for a native Unix PTY or Windows ConPTY. Results distinguish normal exit, signal, cancellation, deadline overrun, and forced timeout. output_offset/output_next_offset are logical byte-stream cursors; after bounded head+tail eviction a response can include an explicit omission marker rather than one contiguous original range. Recover lost/truncated presentation with write_stdin(since_output_offset=...) instead of re-running; evicted bytes are unrecoverable. Finished truncated sessions retain a recovery session_id. No extra approval is requested."
+        description = "Start a bounded command with a project-relative working directory. The effective execution backend may be Bubblewrap or native YOLO; native execution is not OS-filesystem-confined. Returns immediately when it exits, otherwise returns a project-scoped session_id for write_stdin. For one-shot CLIs or subagents that may read until EOF, pass optional stdin and close_stdin=true. Set tty=true for a native Unix PTY or Windows ConPTY. Results distinguish normal exit, signal, cancellation, deadline overrun, and forced timeout. output_offset/output_next_offset are logical byte-stream cursors; after bounded head+tail eviction a response can include an explicit omission marker rather than one contiguous original range. Recover lost/truncated presentation with write_stdin(since_output_offset=...) instead of re-running; evicted bytes are unrecoverable. Forward-compatible optional arguments may also be supplied under extensions; typed top-level fields remain preferred. Finished truncated sessions retain a recovery session_id. No extra approval is requested."
     )]
     async fn exec_command(
         &self,
@@ -1053,7 +1098,15 @@ impl AgentHandler {
         if let Err(error) = self.validate_small(&args.command) {
             return Ok(super::error_result(&error));
         }
-        if let Some(stdin) = args.stdin.as_deref()
+        let stdin = match effective_exec_stdin(&args) {
+            Ok(stdin) => stdin,
+            Err(error) => return Ok(super::error_result(&error)),
+        };
+        let close_stdin = match effective_exec_close_stdin(&args) {
+            Ok(close_stdin) => close_stdin,
+            Err(error) => return Ok(super::error_result(&error)),
+        };
+        if let Some(stdin) = stdin.as_deref()
             && let Err(error) = self.validate_small(stdin)
         {
             return Ok(super::error_result(&error));
@@ -1084,14 +1137,14 @@ impl AgentHandler {
                 .start(&shared.config, &project, &args, global, project_permit)
                 .await?;
             shared.audit.emit(json!({"event":"process_started","request_id":id,"project":crate::audit::project_json(&project),"interactive":true}));
-            if let Some(stdin) = args.stdin.as_ref()
+            if let Some(stdin) = stdin.as_ref()
                 && let Err(error) = session.write_input(stdin.as_bytes().to_vec()).await
             {
                 session.cancellation.cancel();
                 kill_tree(session.pid);
                 return Err(error);
             }
-            if args.close_stdin {
+            if close_stdin {
                 session.close_input().await;
             }
             let value = yield_result(
@@ -1111,7 +1164,7 @@ impl AgentHandler {
     }
 
     #[tool(
-        description = "Write characters to, close input for, resize, signal, or poll a long-running exec_command process in the active project. For tty sessions, provide rows and cols together to resize before input. signal accepts interrupt, terminate, or kill; combine signal with wait_for_exit_ms to wait for terminal completion and drain final output in one call. output_offset/output_next_offset are logical stream cursors. Pass since_output_offset to replay retained history after a lost response; if that cursor falls inside an evicted middle region, replay resumes at the first retained tail byte and includes an explicit omission marker, because evicted bytes cannot be recovered. max_output_tokens is only a presentation cap: if replay is token-truncated, retry the same since_output_offset with a larger or omitted cap. PTY results also include a rendered terminal snapshot."
+        description = "Write characters to, close input for, resize, signal, or poll a long-running exec_command process in the active project. For tty sessions, provide rows and cols together to resize before input. signal accepts interrupt, terminate, or kill; combine signal with wait_for_exit_ms to wait for terminal completion and drain final output in one call. output_offset/output_next_offset are logical stream cursors. Pass since_output_offset to replay retained history after a lost response; if that cursor falls inside an evicted middle region, replay resumes at the first retained tail byte and includes an explicit omission marker, because evicted bytes cannot be recovered. max_output_tokens is only a presentation cap: if replay is token-truncated, retry the same since_output_offset with a larger or omitted cap. Forward-compatible optional arguments may also be supplied under extensions; typed top-level fields remain preferred. PTY results also include a rendered terminal snapshot."
     )]
     async fn write_stdin(
         &self,
@@ -1121,6 +1174,18 @@ impl AgentHandler {
         if let Err(error) = self.validate_small(&args.chars) {
             return Ok(super::error_result(&error));
         }
+        let close_stdin = match effective_write_close_stdin(&args) {
+            Ok(close_stdin) => close_stdin,
+            Err(error) => return Ok(super::error_result(&error)),
+        };
+        let wait_for_exit_ms = match effective_wait_for_exit_ms(&args) {
+            Ok(value) => value,
+            Err(error) => return Ok(super::error_result(&error)),
+        };
+        let since_output_offset = match effective_since_output_offset(&args) {
+            Ok(value) => value,
+            Err(error) => return Ok(super::error_result(&error)),
+        };
         let shared = self.shared.clone();
         let params = serde_json::to_value(&args).unwrap_or_default();
         self.run(context.0, "write_stdin", params, move |project| async move {
@@ -1130,7 +1195,7 @@ impl AgentHandler {
                 || args.cols.is_some()
                 || !args.chars.is_empty()
                 || args.signal.is_some()
-                || args.close_stdin;
+                || close_stdin;
             if mutates_process && session.is_finished() {
                 return Err(AppError::new(
                     "PROCESS_FINISHED",
@@ -1147,10 +1212,10 @@ impl AgentHandler {
             if let Some(signal) = args.signal {
                 session.signal(signal).await?;
             }
-            if args.close_stdin {
+            if close_stdin {
                 session.close_input().await;
             }
-            let yield_ms = if let Some(wait_for_exit_ms) = args.wait_for_exit_ms {
+            let yield_ms = if let Some(wait_for_exit_ms) = wait_for_exit_ms {
                 wait_for_exit_ms.clamp(MIN_YIELD_MS, MAX_POLL_YIELD_MS)
             } else {
                 args.yield_time_ms
@@ -1169,7 +1234,7 @@ impl AgentHandler {
                 &session,
                 yield_ms,
                 args.max_output_tokens,
-                args.since_output_offset,
+                since_output_offset,
             ).await;
             if session.is_finished() {
                 shared.audit.emit(json!({"event":"process_exited","request_id":args.session_id,"project":crate::audit::project_json(&project),"interactive":true}));
@@ -1212,6 +1277,7 @@ mod tests {
             tty: true,
             rows: Some(24),
             cols: Some(80),
+            extensions: BTreeMap::new(),
         };
         let mut command = tokio::process::Command::new("/bin/sh");
         command.arg("-c").arg("kill -TERM $$");
@@ -1464,9 +1530,165 @@ mod tests {
         assert!(stdin.since_output_offset.is_none());
         assert!(stdin.rows.is_none());
         assert!(stdin.cols.is_none());
+        assert!(stdin.extensions.is_empty());
         let exec: ExecCommandArgs = serde_json::from_value(json!({"cmd":"cat"})).unwrap();
         assert!(exec.stdin.is_none());
         assert!(!exec.close_stdin);
+        assert!(exec.extensions.is_empty());
+    }
+
+    #[test]
+    fn forward_compatible_process_extensions_fallback_without_overriding_typed_values() {
+        let exec: ExecCommandArgs = serde_json::from_value(json!({
+            "command":"cat",
+            "extensions":{"stdin":"extension-input","close_stdin":true}
+        }))
+        .unwrap();
+        assert_eq!(
+            effective_exec_stdin(&exec).unwrap().as_deref(),
+            Some("extension-input")
+        );
+        assert!(effective_exec_close_stdin(&exec).unwrap());
+
+        let typed_exec: ExecCommandArgs = serde_json::from_value(json!({
+            "command":"cat",
+            "stdin":"typed-input",
+            "extensions":{"stdin":"extension-input"}
+        }))
+        .unwrap();
+        assert_eq!(
+            effective_exec_stdin(&typed_exec).unwrap().as_deref(),
+            Some("typed-input")
+        );
+
+        let stdin: WriteStdinArgs = serde_json::from_value(json!({
+            "session_id":"abc",
+            "extensions":{"since_output_offset":7,"wait_for_exit_ms":900,"close_stdin":true}
+        }))
+        .unwrap();
+        assert_eq!(effective_since_output_offset(&stdin).unwrap(), Some(7));
+        assert_eq!(effective_wait_for_exit_ms(&stdin).unwrap(), Some(900));
+        assert!(effective_write_close_stdin(&stdin).unwrap());
+
+        let typed_stdin: WriteStdinArgs = serde_json::from_value(json!({
+            "session_id":"abc",
+            "since_output_offset":3,
+            "wait_for_exit_ms":500,
+            "extensions":{"since_output_offset":7,"wait_for_exit_ms":900}
+        }))
+        .unwrap();
+        assert_eq!(
+            effective_since_output_offset(&typed_stdin).unwrap(),
+            Some(3)
+        );
+        assert_eq!(effective_wait_for_exit_ms(&typed_stdin).unwrap(), Some(500));
+    }
+
+    #[test]
+    fn unknown_process_extensions_are_ignored_without_changing_defaults() {
+        let exec: ExecCommandArgs = serde_json::from_value(json!({
+            "command":"true",
+            "extensions":{"future_option":{"nested":true}}
+        }))
+        .unwrap();
+        assert_eq!(effective_exec_stdin(&exec).unwrap(), None);
+        assert!(!effective_exec_close_stdin(&exec).unwrap());
+
+        let stdin: WriteStdinArgs = serde_json::from_value(json!({
+            "session_id":"abc",
+            "extensions":{"future_cursor":{"opaque":"value"}}
+        }))
+        .unwrap();
+        assert_eq!(effective_since_output_offset(&stdin).unwrap(), None);
+        assert_eq!(effective_wait_for_exit_ms(&stdin).unwrap(), None);
+        assert!(!effective_write_close_stdin(&stdin).unwrap());
+    }
+
+    #[test]
+    fn invalid_process_extension_types_fail_closed_unless_typed_value_wins() {
+        let invalid_exec_stdin: ExecCommandArgs = serde_json::from_value(json!({
+            "command":"cat",
+            "extensions":{"stdin":123}
+        }))
+        .unwrap();
+        assert_eq!(
+            effective_exec_stdin(&invalid_exec_stdin)
+                .unwrap_err()
+                .code(),
+            "INVALID_INPUT"
+        );
+
+        let invalid_exec_close: ExecCommandArgs = serde_json::from_value(json!({
+            "command":"cat",
+            "extensions":{"close_stdin":"yes"}
+        }))
+        .unwrap();
+        assert_eq!(
+            effective_exec_close_stdin(&invalid_exec_close)
+                .unwrap_err()
+                .code(),
+            "INVALID_INPUT"
+        );
+
+        let invalid_stdin: WriteStdinArgs = serde_json::from_value(json!({
+            "session_id":"abc",
+            "extensions":{
+                "since_output_offset":-1,
+                "wait_for_exit_ms":"soon",
+                "close_stdin":1
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            effective_since_output_offset(&invalid_stdin)
+                .unwrap_err()
+                .code(),
+            "INVALID_INPUT"
+        );
+        assert_eq!(
+            effective_wait_for_exit_ms(&invalid_stdin)
+                .unwrap_err()
+                .code(),
+            "INVALID_INPUT"
+        );
+        assert_eq!(
+            effective_write_close_stdin(&invalid_stdin)
+                .unwrap_err()
+                .code(),
+            "INVALID_INPUT"
+        );
+
+        let typed_exec: ExecCommandArgs = serde_json::from_value(json!({
+            "command":"cat",
+            "stdin":"typed",
+            "close_stdin":true,
+            "extensions":{"stdin":123,"close_stdin":"invalid"}
+        }))
+        .unwrap();
+        assert_eq!(
+            effective_exec_stdin(&typed_exec).unwrap().as_deref(),
+            Some("typed")
+        );
+        assert!(effective_exec_close_stdin(&typed_exec).unwrap());
+
+        let typed_stdin: WriteStdinArgs = serde_json::from_value(json!({
+            "session_id":"abc",
+            "since_output_offset":4,
+            "wait_for_exit_ms":700,
+            "close_stdin":true,
+            "extensions":{
+                "since_output_offset":"invalid",
+                "wait_for_exit_ms":"invalid",
+                "close_stdin":"invalid"
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            effective_since_output_offset(&typed_stdin).unwrap(),
+            Some(4)
+        );
+        assert_eq!(effective_wait_for_exit_ms(&typed_stdin).unwrap(), Some(700));
+        assert!(effective_write_close_stdin(&typed_stdin).unwrap());
     }
 
     #[test]

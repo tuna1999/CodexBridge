@@ -920,7 +920,7 @@ fn probe_direct_podman_runtime(running_as_root: bool) -> bool {
         "/bin/sh",
         &[
             "-c",
-            "rootless=$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null) || exit 1; if [ \"$rootless\" = false ]; then exit 0; fi; [ \"$rootless\" = true ] || exit 1; exec podman unshare unshare --mount --pid --fork --mount-proc true",
+            "rootless=$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null) || exit 1; if [ \"$rootless\" = false ]; then exit 0; fi; [ \"$rootless\" = true ] || exit 1; command -v unshare >/dev/null 2>&1 || exit 0; exec podman unshare unshare --mount --pid --fork --mount-proc true",
         ],
     )
 }
