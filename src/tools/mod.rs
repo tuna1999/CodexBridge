@@ -70,7 +70,7 @@ where
 
 fn tool_contract_hash(router: &ToolRouter<AgentHandler>) -> String {
     let mut routes = router.map.iter().collect::<Vec<_>>();
-    routes.sort_by(|(left, _), (right, _)| left.cmp(right));
+    routes.sort_by_key(|(name, _)| *name);
     let mut hasher = Sha256::new();
     hasher.update(b"codexbridge-tool-contract-v1\0");
     for (name, route) in routes {
