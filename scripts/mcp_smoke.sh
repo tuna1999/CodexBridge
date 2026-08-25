@@ -590,6 +590,34 @@ jq -e '.result.structuredContent.completion_reason == "exited" and .result.struc
 call_tool write_stdin 1021 "$(jq -cn --arg id "$chunk_session" '{session_id:$id,since_output_offset:0,extensions:{since_output_offset:"invalid"}}')" "$run_root/chunk-typed-precedence.json"
 jq -e '.result.structuredContent.completion_reason == "exited" and .result.structuredContent.output == "CHUNK_A_CHUNK_B" and .result.structuredContent.output_offset == 0' "$run_root/chunk-typed-precedence.json" >/dev/null
 
+# A finished response that is presentation-truncated must keep its recovery
+# handle even if a client first polls without a replay cursor. The subsequent
+# explicit replay must still recover the retained output instead of requiring
+# the command to be re-run.
+call_tool exec_command 1022 '{"cmd":"printf RECOVERY_START_; i=0; while [ $i -lt 400 ]; do printf payload-%04d- $i; i=$((i+1)); done; printf _RECOVERY_END","yield_time_ms":5000,"max_output_tokens":8}' "$run_root/finished-truncated-start.json"
+recovery_session="$(jq -r '.result.structuredContent.session_id // empty' "$run_root/finished-truncated-start.json")"
+[[ -n "$recovery_session" ]]
+jq -e '.result.structuredContent.completion_reason == "exited" and .result.structuredContent.truncated == true' "$run_root/finished-truncated-start.json" >/dev/null
+call_tool write_stdin 1023 "$(jq -cn --arg id "$recovery_session" '{session_id:$id}')" "$run_root/finished-truncated-cursorless.json"
+jq -e --arg id "$recovery_session" '.result.structuredContent.completion_reason == "exited" and .result.structuredContent.output == "" and .result.structuredContent.session_id == $id and (.result.structuredContent.continuation | contains("remains retained for replay"))' "$run_root/finished-truncated-cursorless.json" >/dev/null
+call_tool write_stdin 1024 "$(jq -cn --arg id "$recovery_session" '{session_id:$id,extensions:{since_output_offset:0}}')" "$run_root/finished-truncated-replay.json"
+jq -e '.result.structuredContent.completion_reason == "exited" and .result.structuredContent.output_offset == 0 and .result.structuredContent.session_id == null' "$run_root/finished-truncated-replay.json" >/dev/null
+grep -q 'RECOVERY_START_' "$run_root/finished-truncated-replay.json"
+grep -q '_RECOVERY_END' "$run_root/finished-truncated-replay.json"
+
+# Replay from a cursor inside an evicted middle region must resume at the first
+# retained tail byte and explicitly disclose the omitted gap. The response must
+# never fabricate stale head bytes as if the retained buffer were contiguous.
+call_tool exec_command 1026 '{"cmd":"printf E4_HEAD_UNIQUE; head -c 5000000 /dev/zero | tr \\0 X; printf E4_TAIL_UNIQUE","yield_time_ms":5000,"max_output_tokens":128}' "$run_root/evicted-middle-start.json"
+evicted_session="$(jq -r '.result.structuredContent.session_id // empty' "$run_root/evicted-middle-start.json")"
+[[ -n "$evicted_session" ]]
+jq -e '.result.structuredContent.completion_reason == "exited" and .result.structuredContent.truncated == true' "$run_root/evicted-middle-start.json" >/dev/null
+call_tool write_stdin 1027 "$(jq -cn --arg id "$evicted_session" '{session_id:$id,since_output_offset:2500000,max_output_tokens:128}')" "$run_root/evicted-middle-replay.json"
+jq -e '.result.structuredContent.completion_reason == "exited" and .result.structuredContent.output_offset > 2500000 and .result.structuredContent.truncated == true' "$run_root/evicted-middle-replay.json" >/dev/null
+grep -q 'buffered bytes omitted' "$run_root/evicted-middle-replay.json"
+grep -q 'E4_TAIL_UNIQUE' "$run_root/evicted-middle-replay.json"
+! grep -q 'E4_HEAD_UNIQUE' "$run_root/evicted-middle-replay.json"
+
 # Real PTY path: allocate a terminal, verify the session is interactive, resize
 # it while sending input, and collect the rendered terminal snapshot.
 call_tool exec_command 109 '{"cmd":"printf PTY_READY; read line; echo PTY_GOT:$line","tty":true,"rows":20,"cols":70,"yield_time_ms":250,"timeout_ms":10000}' "$run_root/pty-start.json"
@@ -658,6 +686,8 @@ call_tool recall 103 '{"max_results":2,"include_plan":true}' "$run_root/recall-p
 jq -e '.result.structuredContent.notes | length == 2' "$run_root/recall-page-1.json" >/dev/null
 jq -e '.result.structuredContent.truncated == true and .result.structuredContent.next_offset == 2 and (.result.structuredContent.plan.items[0].step == "smoke") and (.result.structuredContent.continuation | contains("offset=2"))' "$run_root/recall-page-1.json" >/dev/null
 recall_snapshot_hash="$(jq -r '.result.structuredContent.snapshot_hash' "$run_root/recall-page-1.json")"
+call_tool recall 1025 '{"offset":2,"max_results":2}' "$run_root/recall-missing-snapshot.json"
+jq -e '.result.isError == true and (.result.content[0].text | startswith("INVALID_INPUT:")) and (.result.content[0].text | contains("snapshot_hash is required"))' "$run_root/recall-missing-snapshot.json" >/dev/null
 call_tool recall 107 "$(jq -cn --arg hash "$recall_snapshot_hash" '{offset:2,max_results:2,snapshot_hash:$hash,extensions:{snapshot_hash:123}}')" "$run_root/recall-typed-precedence.json"
 jq -e '.result.isError != true and .result.structuredContent.offset == 2 and (.result.structuredContent.notes | length) >= 1' "$run_root/recall-typed-precedence.json" >/dev/null
 call_tool recall 108 '{"offset":2,"max_results":2,"extensions":{"snapshot_hash":123}}' "$run_root/recall-invalid-extension.json"

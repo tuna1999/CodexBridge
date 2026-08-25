@@ -49,6 +49,19 @@ fn effective_snapshot_hash(args: &RecallArgs) -> AppResult<Option<String>> {
     super::extension_arg(&args.extensions, "snapshot_hash")
 }
 
+fn validate_recall_continuation(
+    args: &RecallArgs,
+    snapshot_hash: &Option<String>,
+) -> AppResult<()> {
+    if args.key.is_none() && args.offset > 0 && snapshot_hash.is_none() {
+        return Err(AppError::new(
+            "INVALID_INPUT",
+            "snapshot_hash is required when continuing recall with offset > 0",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct PlanItem {
     pub step: String,
@@ -125,7 +138,7 @@ impl AgentHandler {
     }
 
     #[tool(
-        description = "Read project-scoped working state. With key, return one memory note. Without key, return a bounded lexicographically sorted memory page using offset/max_results. The first page also returns snapshot_hash; pass that exact hash with every next_offset continuation so concurrent memory changes fail with PAGINATION_STALE instead of silently repeating/skipping notes. snapshot_hash and future optional arguments may also be supplied under extensions; typed top-level fields remain preferred. On PAGINATION_STALE, restart enumeration from offset=0 without the old snapshot hash. Set include_plan=true to include the complete persisted plan."
+        description = "Read project-scoped working state. With key, return one memory note. Without key, return a bounded lexicographically sorted memory page using offset/max_results. The first page also returns snapshot_hash; every continuation with offset>0 requires that exact hash so concurrent memory changes fail with PAGINATION_STALE instead of silently repeating/skipping notes. snapshot_hash and future optional arguments may also be supplied under extensions; typed top-level fields remain preferred. On PAGINATION_STALE, restart enumeration from offset=0 without the old snapshot hash. Set include_plan=true to include the complete persisted plan."
     )]
     async fn recall(
         &self,
@@ -140,6 +153,7 @@ impl AgentHandler {
         let params = serde_json::to_value(&args).unwrap_or_default();
         self.run(context.0, "recall", params, move |project| async move {
             let project_key = project.effective_project_key.as_str();
+              validate_recall_continuation(&args, &snapshot_hash)?;
             if let Some(key) = args.key {
                 let key = normalized_memory_key(&key)?;
                 return Ok(json!({
@@ -292,6 +306,26 @@ mod tests {
         let error = effective_snapshot_hash(&args).unwrap_err();
         assert_eq!(error.code(), "INVALID_INPUT");
         assert!(error.message().contains("extensions.snapshot_hash"));
+    }
+
+    #[test]
+    fn recall_continuation_without_snapshot_hash_is_rejected() {
+        let args: RecallArgs = serde_json::from_value(json!({"offset":1})).unwrap();
+        let snapshot_hash = effective_snapshot_hash(&args).unwrap();
+        let error = validate_recall_continuation(&args, &snapshot_hash).unwrap_err();
+        assert_eq!(error.code(), "INVALID_INPUT");
+        assert!(error.message().contains("snapshot_hash is required"));
+
+        let direct: RecallArgs = serde_json::from_value(json!({"key":"alpha","offset":1})).unwrap();
+        validate_recall_continuation(&direct, &None).unwrap();
+
+        let extension: RecallArgs = serde_json::from_value(json!({
+            "offset":1,
+            "extensions":{"snapshot_hash":"snapshot"}
+        }))
+        .unwrap();
+        let extension_hash = effective_snapshot_hash(&extension).unwrap();
+        validate_recall_continuation(&extension, &extension_hash).unwrap();
     }
 
     #[tokio::test]

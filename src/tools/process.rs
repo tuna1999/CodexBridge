@@ -247,6 +247,10 @@ struct InteractiveSession {
     completion: Mutex<Option<ProcessCompletion>>,
     timed_out: AtomicBool,
     deadline_exceeded: AtomicBool,
+    /// Set once a finished response is truncated. Keep returning the session id
+    /// on cursorless polls so callers do not lose the ability to replay retained
+    /// output merely because one follow-up response itself is empty/untruncated.
+    replay_pending: AtomicBool,
     requested_signal: Mutex<Option<ProcessSignal>>,
     started: Instant,
     last_activity: Mutex<Instant>,
@@ -557,6 +561,7 @@ impl ProcessRegistry {
             completion: Mutex::new(None),
             timed_out: AtomicBool::new(false),
             deadline_exceeded: AtomicBool::new(false),
+            replay_pending: AtomicBool::new(false),
             requested_signal: Mutex::new(None),
             started: Instant::now(),
             last_activity: Mutex::new(Instant::now()),
@@ -686,6 +691,7 @@ impl ProcessRegistry {
             completion: Mutex::new(None),
             timed_out: AtomicBool::new(false),
             deadline_exceeded: AtomicBool::new(false),
+            replay_pending: AtomicBool::new(false),
             requested_signal: Mutex::new(None),
             started: Instant::now(),
             last_activity: Mutex::new(Instant::now()),
@@ -1047,7 +1053,16 @@ async fn yield_result(
         .and_then(|value| value.map(ProcessSignal::as_str));
     let finished = completion.is_some();
     let (output, original_token_count) = token_window(output, max_output_tokens);
-    let recoverable_finished = finished && (byte_truncated || original_token_count.is_some());
+    let response_truncated = byte_truncated || original_token_count.is_some();
+    if finished && response_truncated {
+        session.replay_pending.store(true, Ordering::Relaxed);
+    } else if finished && since_output_offset.is_some() {
+        // An explicit replay that fits in one response satisfies a previous
+        // presentation-only truncation. Byte-evicted output remains truncated
+        // and therefore keeps replay_pending set until normal retention expiry.
+        session.replay_pending.store(false, Ordering::Relaxed);
+    }
+    let replay_pending = finished && session.replay_pending.load(Ordering::Relaxed);
     let terminal_snapshot = session.terminal_snapshot().map(|snapshot| {
         let (snapshot, original_token_count) = token_window(snapshot, max_output_tokens);
         json!({
@@ -1058,7 +1073,7 @@ async fn yield_result(
     });
     json!({
         "chunk_id": Uuid::now_v7().simple().to_string(),
-        "session_id": if finished && !recoverable_finished { None } else { Some(id) },
+        "session_id": if finished && !replay_pending { None } else { Some(id) },
         "exit_code": exit_code,
         "completion_reason": completion_reason,
         "signal": signal,
@@ -1068,15 +1083,17 @@ async fn yield_result(
         "output_bytes": session.output.lock().map(|output| output.total_bytes).unwrap_or(0),
         "output_offset": output_offset,
         "output_next_offset": output_next_offset,
-        "truncated": byte_truncated || original_token_count.is_some(),
+        "truncated": response_truncated,
         "original_token_count": original_token_count,
         "timed_out": session.timed_out.load(Ordering::Relaxed),
         "deadline_exceeded": session.deadline_exceeded.load(Ordering::Relaxed),
         "tty": session.tty,
         "terminal_snapshot": terminal_snapshot,
         "wall_time_seconds": session.started.elapsed().as_secs_f64(),
-        "continuation": if recoverable_finished {
+        "continuation": if finished && response_truncated {
             Some("The process finished, but this response was truncated. Call write_stdin with this session_id and since_output_offset to replay retained final output before considering a rerun.")
+        } else if replay_pending {
+            Some("A previous finished response was truncated. This session remains retained for replay; call write_stdin with this session_id and since_output_offset before considering a rerun.")
         } else if finished {
             None
         } else {
@@ -1355,6 +1372,7 @@ mod tests {
             })),
             timed_out: AtomicBool::new(false),
             deadline_exceeded: AtomicBool::new(false),
+            replay_pending: AtomicBool::new(false),
             requested_signal: Mutex::new(None),
             started: Instant::now(),
             last_activity: Mutex::new(Instant::now()),
@@ -1425,6 +1443,31 @@ mod tests {
             Some("recoverable-session"),
             "finished sessions with truncated output must remain addressable for replay"
         );
+    }
+
+    #[tokio::test]
+    async fn regression_cursorless_poll_does_not_discard_finished_replay_state() {
+        let session = test_session(Some(0));
+        session.output.lock().unwrap().append(b"final-output", 1024);
+
+        let first = yield_result("replay-retained", &session, 1, Some(1), None).await;
+        assert_eq!(first["truncated"], true);
+        assert_eq!(first["session_id"], "replay-retained");
+
+        let cursorless = yield_result("replay-retained", &session, 1, None, None).await;
+        assert_eq!(cursorless["output"], "");
+        assert_eq!(cursorless["truncated"], false);
+        assert_eq!(cursorless["session_id"], "replay-retained");
+        assert!(
+            cursorless["continuation"]
+                .as_str()
+                .is_some_and(|value| value.contains("remains retained for replay"))
+        );
+
+        let replayed = yield_result("replay-retained", &session, 1, None, Some(0)).await;
+        assert_eq!(replayed["output"], "final-output");
+        assert_eq!(replayed["session_id"], Value::Null);
+        assert_eq!(replayed["continuation"], Value::Null);
     }
 
     #[tokio::test]
@@ -1722,6 +1765,7 @@ mod tests {
             completion: Mutex::new(None),
             timed_out: AtomicBool::new(false),
             deadline_exceeded: AtomicBool::new(false),
+            replay_pending: AtomicBool::new(false),
             requested_signal: Mutex::new(None),
             started: Instant::now(),
             last_activity: Mutex::new(Instant::now()),
