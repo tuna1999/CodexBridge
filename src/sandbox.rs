@@ -1,0 +1,1955 @@
+use std::{
+    collections::BTreeMap,
+    ffi::OsStr,
+    path::{Component, Path, PathBuf},
+    process::{Command as StdCommand, Stdio},
+    sync::OnceLock,
+    time::Duration,
+};
+
+use serde::Serialize;
+use tokio::{io::AsyncReadExt, process::Command};
+
+use crate::{
+    config::Config,
+    error::{AppError, Result},
+    project::ProjectContext,
+};
+
+#[derive(Debug, Clone, Copy)]
+pub enum PathOperation {
+    Existing,
+    Create,
+}
+
+#[derive(Clone, Default)]
+pub struct SecurePathResolver;
+
+impl SecurePathResolver {
+    pub fn resolve_project_path(
+        &self,
+        project_root: &Path,
+        user_path: &str,
+        operation: PathOperation,
+    ) -> Result<PathBuf> {
+        if user_path.is_empty() || user_path.len() > 4096 || user_path.contains('\0') {
+            return Err(AppError::new(
+                "PATH_OUTSIDE_WORKSPACE",
+                "path is empty or too long",
+            ));
+        }
+        if user_path.contains('\\') {
+            return Err(AppError::new(
+                "PATH_OUTSIDE_WORKSPACE",
+                "backslash and Windows/UNC paths are not accepted",
+            ));
+        }
+        let relative = Path::new(user_path);
+        if relative.is_absolute() {
+            return Err(AppError::new(
+                "PATH_OUTSIDE_WORKSPACE",
+                "absolute paths are not accepted",
+            ));
+        }
+        for component in relative.components() {
+            if !matches!(component, Component::Normal(_) | Component::CurDir) {
+                return Err(AppError::new(
+                    "PATH_OUTSIDE_WORKSPACE",
+                    "path traversal is not accepted",
+                ));
+            }
+        }
+
+        let canonical_root = project_root.canonicalize()?;
+        let mut current = canonical_root.clone();
+        let components: Vec<&OsStr> = relative
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(value) => Some(value),
+                _ => None,
+            })
+            .collect();
+        for (index, component) in components.iter().enumerate() {
+            current.push(component);
+            match std::fs::symlink_metadata(&current) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() {
+                        return Err(AppError::new(
+                            "SYMLINK_ESCAPE",
+                            format!("symlink component rejected: {}", relative.display()),
+                        ));
+                    }
+                    let canonical = current.canonicalize()?;
+                    if !canonical.starts_with(&canonical_root) {
+                        return Err(AppError::new(
+                            "PATH_OUTSIDE_WORKSPACE",
+                            "canonical path escaped the project",
+                        ));
+                    }
+                    current = canonical;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if matches!(operation, PathOperation::Existing) {
+                        return Err(AppError::new(
+                            "FILE_NOT_FOUND",
+                            format!("{} does not exist", relative.display()),
+                        ));
+                    }
+                    for rest in &components[index + 1..] {
+                        current.push(rest);
+                    }
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if !current.starts_with(&canonical_root) {
+            return Err(AppError::new(
+                "PATH_OUTSIDE_WORKSPACE",
+                "resolved path escaped the project",
+            ));
+        }
+        Ok(current)
+    }
+
+    pub fn read_file_bounded(
+        &self,
+        project_root: &Path,
+        user_path: &str,
+        maximum: usize,
+    ) -> Result<Vec<u8>> {
+        #[cfg(unix)]
+        {
+            unix_capability::read_file_bounded(project_root, user_path, maximum)
+        }
+        #[cfg(not(unix))]
+        {
+            let path =
+                self.resolve_project_path(project_root, user_path, PathOperation::Existing)?;
+            let file = std::fs::File::open(&path)?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Err(AppError::new("INVALID_INPUT", "path is not a regular file"));
+            }
+            if metadata.len() as usize > maximum {
+                return Err(AppError::new(
+                    "RESOURCE_LIMIT_EXCEEDED",
+                    "file exceeds read limit",
+                ));
+            }
+            use std::io::Read as _;
+            let mut bytes = Vec::with_capacity((metadata.len() as usize).min(maximum));
+            file.take((maximum + 1) as u64).read_to_end(&mut bytes)?;
+            if bytes.len() > maximum {
+                return Err(AppError::new(
+                    "RESOURCE_LIMIT_EXCEEDED",
+                    "file exceeds read limit",
+                ));
+            }
+            Ok(bytes)
+        }
+    }
+
+    /// Open one regular file without following symlinks. Callers that need a
+    /// multi-phase read can keep this descriptor open so metadata and content
+    /// come from the same inode even if the pathname is atomically replaced.
+    pub(crate) fn open_regular_file(
+        &self,
+        project_root: &Path,
+        user_path: &str,
+    ) -> Result<std::fs::File> {
+        #[cfg(unix)]
+        {
+            unix_capability::open_regular_file(project_root, user_path)
+        }
+        #[cfg(not(unix))]
+        {
+            let path =
+                self.resolve_project_path(project_root, user_path, PathOperation::Existing)?;
+            let file = std::fs::File::open(path)?;
+            if !file.metadata()?.is_file() {
+                return Err(AppError::new("INVALID_INPUT", "path is not a regular file"));
+            }
+            Ok(file)
+        }
+    }
+
+    /// Read a bounded byte range without requiring the whole file to fit in
+    /// memory. Returns the bytes and the file's total length. The same
+    /// descriptor-relative/no-follow path walk used by direct reads protects
+    /// the open operation from symlink replacement races.
+    pub fn read_file_range(
+        &self,
+        project_root: &Path,
+        user_path: &str,
+        offset: u64,
+        maximum: usize,
+    ) -> Result<(Vec<u8>, u64)> {
+        #[cfg(unix)]
+        {
+            unix_capability::read_file_range(project_root, user_path, offset, maximum)
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::{Read, Seek, SeekFrom};
+            let path =
+                self.resolve_project_path(project_root, user_path, PathOperation::Existing)?;
+            let mut file = std::fs::File::open(path)?;
+            let length = file.metadata()?.len();
+            if offset > length {
+                return Err(AppError::new("INVALID_INPUT", "offset is outside the file"));
+            }
+            file.seek(SeekFrom::Start(offset))?;
+            let mut bytes = Vec::with_capacity(maximum.min(length.saturating_sub(offset) as usize));
+            file.take(maximum as u64).read_to_end(&mut bytes)?;
+            Ok((bytes, length))
+        }
+    }
+
+    pub fn write_file_atomic(
+        &self,
+        project_root: &Path,
+        user_path: &str,
+        data: &[u8],
+    ) -> Result<()> {
+        #[cfg(unix)]
+        {
+            unix_capability::write_file_atomic(project_root, user_path, data)
+        }
+        #[cfg(not(unix))]
+        {
+            let path = self.resolve_project_path(project_root, user_path, PathOperation::Create)?;
+            let parent = path
+                .parent()
+                .ok_or_else(|| AppError::new("PATH_OUTSIDE_WORKSPACE", "target has no parent"))?;
+            std::fs::create_dir_all(parent)?;
+            let temporary = parent.join(format!(".rust-agent-{}.tmp", uuid::Uuid::now_v7()));
+            std::fs::write(&temporary, data)?;
+            std::fs::rename(temporary, path)?;
+            Ok(())
+        }
+    }
+
+    pub fn create_directory_all(&self, project_root: &Path, user_path: &str) -> Result<()> {
+        #[cfg(unix)]
+        {
+            unix_capability::create_directory_all(project_root, user_path)
+        }
+        #[cfg(not(unix))]
+        {
+            let path = self.resolve_project_path(project_root, user_path, PathOperation::Create)?;
+            std::fs::create_dir_all(path)?;
+            Ok(())
+        }
+    }
+
+    pub fn copy_file_secure(
+        &self,
+        project_root: &Path,
+        source: &str,
+        destination: &str,
+        maximum: usize,
+    ) -> Result<u64> {
+        let bytes = self.read_file_bounded(project_root, source, maximum)?;
+        self.write_file_atomic(project_root, destination, &bytes)?;
+        Ok(bytes.len() as u64)
+    }
+
+    pub fn move_path_secure(
+        &self,
+        project_root: &Path,
+        source: &str,
+        destination: &str,
+    ) -> Result<()> {
+        #[cfg(unix)]
+        {
+            unix_capability::move_path(project_root, source, destination)
+        }
+        #[cfg(not(unix))]
+        {
+            let source =
+                self.resolve_project_path(project_root, source, PathOperation::Existing)?;
+            let destination =
+                self.resolve_project_path(project_root, destination, PathOperation::Create)?;
+            std::fs::rename(source, destination)?;
+            Ok(())
+        }
+    }
+
+    pub fn remove_path_secure(&self, project_root: &Path, user_path: &str) -> Result<()> {
+        #[cfg(unix)]
+        {
+            unix_capability::remove_path(project_root, user_path)
+        }
+        #[cfg(not(unix))]
+        {
+            let path =
+                self.resolve_project_path(project_root, user_path, PathOperation::Existing)?;
+            if std::fs::metadata(&path)?.is_dir() {
+                std::fs::remove_dir_all(path)?;
+            } else {
+                std::fs::remove_file(path)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(unix)]
+mod unix_capability {
+    use std::{
+        ffi::CString,
+        fs::File,
+        io::{Read, Write},
+        os::{
+            fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
+            unix::ffi::OsStrExt,
+        },
+        path::{Component, Path},
+    };
+
+    use uuid::Uuid;
+
+    use crate::error::{AppError, Result};
+
+    fn components(user_path: &str) -> Result<Vec<CString>> {
+        if user_path.is_empty()
+            || user_path.len() > 4096
+            || user_path.contains('\0')
+            || user_path.contains('\\')
+        {
+            return Err(AppError::new(
+                "PATH_OUTSIDE_WORKSPACE",
+                "invalid relative path",
+            ));
+        }
+        let path = Path::new(user_path);
+        if path.is_absolute() {
+            return Err(AppError::new(
+                "PATH_OUTSIDE_WORKSPACE",
+                "absolute paths are not accepted",
+            ));
+        }
+        let mut values = Vec::new();
+        for component in path.components() {
+            match component {
+                Component::CurDir => {}
+                Component::Normal(value) => {
+                    values.push(CString::new(value.as_bytes()).map_err(|_| {
+                        AppError::new("PATH_OUTSIDE_WORKSPACE", "path contains NUL")
+                    })?)
+                }
+                _ => {
+                    return Err(AppError::new(
+                        "PATH_OUTSIDE_WORKSPACE",
+                        "path traversal is not accepted",
+                    ));
+                }
+            }
+        }
+        if values.is_empty() {
+            return Err(AppError::new("PATH_OUTSIDE_WORKSPACE", "path is empty"));
+        }
+        Ok(values)
+    }
+
+    fn open_root(root: &Path) -> Result<File> {
+        let bytes = root.as_os_str().as_bytes();
+        let path = CString::new(bytes)
+            .map_err(|_| AppError::new("PATH_OUTSIDE_WORKSPACE", "invalid project root"))?;
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        file_from_fd(fd)
+    }
+
+    fn file_from_fd(fd: RawFd) -> Result<File> {
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            let code = if error
+                .raw_os_error()
+                .is_some_and(|code| code == libc::ELOOP || code == libc::ENOTDIR)
+            {
+                "SYMLINK_ESCAPE"
+            } else if error.kind() == std::io::ErrorKind::NotFound {
+                "FILE_NOT_FOUND"
+            } else {
+                "PROCESS_FAILED"
+            };
+            return Err(AppError::new(code, error.to_string()));
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    fn open_parent(root: &Path, path: &[CString], create: bool) -> Result<File> {
+        let mut directory = open_root(root)?;
+        for component in &path[..path.len().saturating_sub(1)] {
+            if create {
+                let status =
+                    unsafe { libc::mkdirat(directory.as_raw_fd(), component.as_ptr(), 0o755) };
+                if status != 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::EEXIST) {
+                        return Err(error.into());
+                    }
+                }
+            }
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    component.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            directory = file_from_fd(fd)?;
+        }
+        Ok(directory)
+    }
+
+    pub(super) fn open_regular_file(root: &Path, user_path: &str) -> Result<File> {
+        let path = components(user_path)?;
+        let parent = open_parent(root, &path, false)?;
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                path.last().expect("nonempty path").as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        let file = file_from_fd(fd)?;
+        if !file.metadata()?.is_file() {
+            return Err(AppError::new("INVALID_INPUT", "path is not a regular file"));
+        }
+        Ok(file)
+    }
+
+    pub fn read_file_bounded(root: &Path, user_path: &str, maximum: usize) -> Result<Vec<u8>> {
+        let file = open_regular_file(root, user_path)?;
+        let length = file.metadata()?.len() as usize;
+        if length > maximum {
+            return Err(AppError::new(
+                "RESOURCE_LIMIT_EXCEEDED",
+                "file exceeds read limit",
+            ));
+        }
+        let mut bytes = Vec::with_capacity(length.min(maximum));
+        file.take((maximum + 1) as u64).read_to_end(&mut bytes)?;
+        if bytes.len() > maximum {
+            return Err(AppError::new(
+                "RESOURCE_LIMIT_EXCEEDED",
+                "file exceeds read limit",
+            ));
+        }
+        Ok(bytes)
+    }
+
+    pub fn read_file_range(
+        root: &Path,
+        user_path: &str,
+        offset: u64,
+        maximum: usize,
+    ) -> Result<(Vec<u8>, u64)> {
+        use std::os::unix::fs::FileExt;
+
+        let file = open_regular_file(root, user_path)?;
+        let length = file.metadata()?.len();
+        if offset > length {
+            return Err(AppError::new("INVALID_INPUT", "offset is outside the file"));
+        }
+        let wanted = maximum.min(length.saturating_sub(offset) as usize);
+        let mut bytes = vec![0_u8; wanted];
+        let mut read = 0usize;
+        while read < wanted {
+            let count = file.read_at(&mut bytes[read..], offset + read as u64)?;
+            if count == 0 {
+                break;
+            }
+            read += count;
+        }
+        bytes.truncate(read);
+        Ok((bytes, length))
+    }
+
+    pub fn write_file_atomic(root: &Path, user_path: &str, data: &[u8]) -> Result<()> {
+        let path = components(user_path)?;
+        let parent = open_parent(root, &path, true)?;
+        let target = path.last().expect("nonempty path");
+        let mut existing: libc::stat = unsafe { std::mem::zeroed() };
+        let existing_status = unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                target.as_ptr(),
+                &mut existing,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        let target_mode = if existing_status == 0 {
+            if existing.st_mode & libc::S_IFMT == libc::S_IFLNK {
+                return Err(AppError::new("SYMLINK_ESCAPE", "symlink target rejected"));
+            }
+            existing.st_mode & 0o777
+        } else {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error.into());
+            }
+            0o600
+        };
+        let temporary_name = CString::new(format!(".rust-agent-{}.tmp", Uuid::now_v7()))
+            .expect("UUID temp name has no NUL");
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                temporary_name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        let mut temporary = file_from_fd(fd)?;
+        if unsafe { libc::fchmod(temporary.as_raw_fd(), target_mode as libc::mode_t) } != 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                libc::unlinkat(parent.as_raw_fd(), temporary_name.as_ptr(), 0);
+            }
+            return Err(error.into());
+        }
+        if let Err(error) = temporary
+            .write_all(data)
+            .and_then(|()| temporary.sync_all())
+        {
+            unsafe {
+                libc::unlinkat(parent.as_raw_fd(), temporary_name.as_ptr(), 0);
+            }
+            return Err(error.into());
+        }
+        let status = unsafe {
+            libc::renameat(
+                parent.as_raw_fd(),
+                temporary_name.as_ptr(),
+                parent.as_raw_fd(),
+                target.as_ptr(),
+            )
+        };
+        if status != 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                libc::unlinkat(parent.as_raw_fd(), temporary_name.as_ptr(), 0);
+            }
+            return Err(error.into());
+        }
+        parent.sync_all()?;
+        Ok(())
+    }
+
+    pub fn create_directory_all(root: &Path, user_path: &str) -> Result<()> {
+        let mut path = components(user_path)?;
+        path.push(CString::new("sentinel").expect("static string"));
+        let _ = open_parent(root, &path, true)?;
+        Ok(())
+    }
+
+    pub fn move_path(root: &Path, source: &str, destination: &str) -> Result<()> {
+        let source = components(source)?;
+        let destination = components(destination)?;
+        let source_parent = open_parent(root, &source, false)?;
+        let destination_parent = open_parent(root, &destination, true)?;
+        let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+        let status = unsafe {
+            libc::fstatat(
+                source_parent.as_raw_fd(),
+                source.last().expect("nonempty path").as_ptr(),
+                &mut metadata,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if status != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if metadata.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            return Err(AppError::new("SYMLINK_ESCAPE", "symlink source rejected"));
+        }
+        let status = unsafe {
+            libc::renameat(
+                source_parent.as_raw_fd(),
+                source.last().expect("nonempty path").as_ptr(),
+                destination_parent.as_raw_fd(),
+                destination.last().expect("nonempty path").as_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+
+    fn remove_entry(parent: RawFd, name: &CString) -> Result<()> {
+        struct DirectoryStream(*mut libc::DIR);
+
+        impl Drop for DirectoryStream {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::closedir(self.0);
+                }
+            }
+        }
+
+        let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::fstatat(
+                parent,
+                name.as_ptr(),
+                &mut metadata,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if metadata.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            let directory = file_from_fd(unsafe {
+                libc::openat(
+                    parent,
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            })?;
+            // fdopendir works on Linux, macOS, and the other supported Unix
+            // targets; unlike /proc/self/fd it does not require procfs to be
+            // mounted (common in containers and absent on macOS).
+            let directory_fd = directory.into_raw_fd();
+            let stream = unsafe { libc::fdopendir(directory_fd) };
+            if stream.is_null() {
+                let error = std::io::Error::last_os_error();
+                unsafe { libc::close(directory_fd) };
+                return Err(error.into());
+            }
+            let stream = DirectoryStream(stream);
+            let mut children = Vec::new();
+            loop {
+                let entry = unsafe { libc::readdir(stream.0) };
+                if entry.is_null() {
+                    break;
+                }
+                let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+                if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                    continue;
+                }
+                children.push(CString::new(name.to_bytes()).map_err(|_| {
+                    AppError::new("PROCESS_FAILED", "directory entry contains NUL")
+                })?);
+            }
+            let child_parent = unsafe { libc::dirfd(stream.0) };
+            for child in children {
+                remove_entry(child_parent, &child)?;
+            }
+            drop(stream);
+            if unsafe { libc::unlinkat(parent, name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        } else if unsafe { libc::unlinkat(parent, name.as_ptr(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+
+    pub fn remove_path(root: &Path, user_path: &str) -> Result<()> {
+        let path = components(user_path)?;
+        let parent = open_parent(root, &path, false)?;
+        remove_entry(parent.as_raw_fd(), path.last().expect("nonempty path"))
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProcessResult {
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub timed_out: bool,
+    pub truncated: bool,
+    pub stdout_bytes: usize,
+    pub stderr_bytes: usize,
+}
+
+async fn bounded_read<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: R,
+    limit: usize,
+) -> std::io::Result<(Vec<u8>, usize, bool)> {
+    let mut retained = Vec::with_capacity(limit.min(64 * 1024));
+    let mut total = 0usize;
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read);
+        if retained.len() < limit {
+            let remaining = limit - retained.len();
+            retained.extend_from_slice(&buffer[..read.min(remaining)]);
+        }
+    }
+    Ok((retained, total, total > limit))
+}
+
+#[cfg(unix)]
+pub(crate) fn process_limits(command: &mut Command, timeout: Duration) {
+    let cpu_seconds = timeout.as_secs().saturating_add(2).max(2);
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let cpu = libc::rlimit {
+                rlim_cur: cpu_seconds,
+                rlim_max: cpu_seconds.saturating_add(1),
+            };
+            let nofile = libc::rlimit {
+                rlim_cur: 256,
+                rlim_max: 256,
+            };
+            // RLIMIT_NPROC is counted per real UID on Linux, not per child
+            // process tree. Applying a small value here can make an otherwise
+            // idle project unable to fork when the daemon UID is shared with
+            // platform/background processes. Process fan-out must instead be
+            // bounded by the configured process concurrency and the outer
+            // container/cgroup PID limit.
+            for (resource, limit) in [(libc::RLIMIT_CPU, cpu), (libc::RLIMIT_NOFILE, nofile)] {
+                if libc::setrlimit(resource, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn process_limits(_command: &mut Command, _timeout: Duration) {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellKind {
+    Posix,
+    PowerShell,
+    Cmd,
+}
+
+impl ShellKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Posix => "posix",
+            Self::PowerShell => "powershell",
+            Self::Cmd => "cmd",
+        }
+    }
+}
+
+fn shell_kind(shell: &str) -> ShellKind {
+    let base = shell.rsplit(['/', '\\']).next().unwrap_or(shell);
+    let base = if base.len() >= 4 && base[base.len() - 4..].eq_ignore_ascii_case(".exe") {
+        &base[..base.len() - 4]
+    } else {
+        base
+    };
+    match base.to_ascii_lowercase().as_str() {
+        "powershell" | "pwsh" => ShellKind::PowerShell,
+        "cmd" => ShellKind::Cmd,
+        _ => ShellKind::Posix,
+    }
+}
+
+fn shell_command(
+    explicit: Option<&str>,
+    command_text: &str,
+) -> Result<(String, Vec<String>, String)> {
+    let shell = explicit
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(default_shell);
+    if shell.len() > 4096 || shell.contains(['\0', '\n', '\r']) {
+        return Err(AppError::new("INVALID_INPUT", "invalid shell executable"));
+    }
+    let kind = shell_kind(&shell);
+    let (args, command_text) = match kind {
+        ShellKind::PowerShell => (
+            vec![
+                "-NoLogo".to_owned(),
+                "-NoProfile".to_owned(),
+                "-Command".to_owned(),
+            ],
+            powershell_script(command_text),
+        ),
+        ShellKind::Cmd => (
+            vec!["/d".to_owned(), "/s".to_owned(), "/c".to_owned()],
+            command_text.to_owned(),
+        ),
+        ShellKind::Posix => (vec!["-c".to_owned()], command_text.to_owned()),
+    };
+    Ok((shell, args, command_text))
+}
+
+fn default_shell() -> String {
+    if cfg!(windows) {
+        "powershell.exe".to_owned()
+    } else {
+        std::env::var("SHELL")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "/bin/sh".to_owned())
+    }
+}
+
+fn powershell_script(command_text: &str) -> String {
+    format!(
+        "& {{\n{command_text}\n}}; if ($null -ne $LASTEXITCODE) {{ exit $LASTEXITCODE }} elseif (-not $?) {{ exit 1 }}"
+    )
+}
+
+fn sanitized_base_environment(command: &mut Command, use_bwrap: bool) {
+    if cfg!(windows) {
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
+        let path = std::env::var("PATH").unwrap_or_else(|_| {
+            format!(r"{system_root}\System32;{system_root};{system_root}\System32\WindowsPowerShell\v1.0")
+        });
+        let temporary = std::env::temp_dir();
+        command.env("PATH", path);
+        command.env("SystemRoot", &system_root);
+        command.env("WINDIR", &system_root);
+        if let Ok(comspec) = std::env::var("ComSpec") {
+            command.env("ComSpec", comspec);
+        }
+        command.env("TEMP", &temporary);
+        command.env("TMP", &temporary);
+    } else {
+        let path = if use_bwrap {
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned()
+        } else {
+            std::env::var("PATH")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| {
+                    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned()
+                })
+        };
+        command.env("PATH", path);
+        command.env("HOME", "/tmp");
+        command.env("TMPDIR", "/tmp");
+        command.env("LANG", "C.UTF-8");
+    }
+}
+
+static BWRAP_USABLE: OnceLock<bool> = OnceLock::new();
+static PODMAN_IN_BWRAP_USABLE: OnceLock<bool> = OnceLock::new();
+
+fn probe_bwrap() -> bool {
+    if !cfg!(target_os = "linux") || !Path::new("/usr/bin/bwrap").is_file() {
+        return false;
+    }
+    StdCommand::new("/usr/bin/bwrap")
+        .args([
+            "--unshare-all",
+            "--share-net",
+            "--die-with-parent",
+            "--ro-bind",
+            "/",
+            "/",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "/bin/true",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+pub(crate) fn bwrap_usable() -> bool {
+    *BWRAP_USABLE.get_or_init(probe_bwrap)
+}
+
+fn invokes_podman(command: &str) -> bool {
+    command
+        .split(|character: char| "|&;()<>".contains(character))
+        .any(segment_invokes_podman)
+}
+
+fn segment_invokes_podman(segment: &str) -> bool {
+    let tokens = segment
+        .split_whitespace()
+        .map(|token| token.trim_matches(['\'', '"']))
+        .filter(|token| !token.is_empty());
+    for token in tokens {
+        if token.contains('=') && !token.starts_with('=') {
+            continue;
+        }
+        let base = token.rsplit(['/', '\\']).next().unwrap_or(token);
+        if matches!(base, "env" | "command" | "exec" | "nohup" | "sudo") {
+            continue;
+        }
+        return base == "podman";
+    }
+    false
+}
+
+fn wait_probe(mut child: std::process::Child, timeout: Duration) -> bool {
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+fn probe_podman_in_bwrap(config: &Config, project: &ProjectContext) -> bool {
+    if !bwrap_usable() {
+        return false;
+    }
+    let mut command = match bubblewrap_base_std_command(config, project, &project.project_root) {
+        Ok(command) => command,
+        Err(_) => return false,
+    };
+    command
+        .arg("podman")
+        .args(["info", "--format", "json"])
+        .env_clear();
+    sanitized_base_std_environment(&mut command, true);
+    if let Some(socket) = &config.container_socket {
+        command
+            .env("CONTAINER_HOST", "unix:///run/podman.sock")
+            .env("DOCKER_HOST", "unix:///run/podman.sock");
+        if !socket.exists() {
+            return false;
+        }
+    }
+    let child = match command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+    wait_probe(child, Duration::from_secs(3))
+}
+
+fn podman_usable_inside_bwrap(config: &Config, project: &ProjectContext) -> bool {
+    *PODMAN_IN_BWRAP_USABLE.get_or_init(|| probe_podman_in_bwrap(config, project))
+}
+
+fn should_use_bwrap(
+    sandbox_backend: &str,
+    bwrap_ok: bool,
+    podman_command: bool,
+    podman_in_bwrap_ok: bool,
+) -> bool {
+    matches!(sandbox_backend, "auto" | "bwrap")
+        && bwrap_ok
+        && (!podman_command || podman_in_bwrap_ok)
+}
+
+fn use_bwrap(config: &Config, project: &ProjectContext, command: Option<&str>) -> bool {
+    if !matches!(config.sandbox_backend.as_str(), "auto" | "bwrap") {
+        return false;
+    }
+    let bwrap_ok = bwrap_usable();
+    if !bwrap_ok {
+        return false;
+    }
+    let podman_command = command.is_some_and(invokes_podman);
+    let podman_in_bwrap_ok = !podman_command || podman_usable_inside_bwrap(config, project);
+    should_use_bwrap(
+        &config.sandbox_backend,
+        bwrap_ok,
+        podman_command,
+        podman_in_bwrap_ok,
+    )
+}
+
+pub(crate) fn effective_default_sandbox_backend(config: &Config) -> &'static str {
+    if matches!(config.sandbox_backend.as_str(), "auto" | "bwrap") && bwrap_usable() {
+        "bubblewrap"
+    } else {
+        "native"
+    }
+}
+
+pub(crate) fn default_exec_shell(config: &Config) -> (String, &'static str, Vec<String>) {
+    let shell = if matches!(config.sandbox_backend.as_str(), "auto" | "bwrap") && bwrap_usable() {
+        "/bin/sh".to_owned()
+    } else {
+        default_shell()
+    };
+    let kind = shell_kind(&shell);
+    let args = match kind {
+        ShellKind::PowerShell => vec![
+            "-NoLogo".to_owned(),
+            "-NoProfile".to_owned(),
+            "-Command".to_owned(),
+        ],
+        ShellKind::Cmd => vec!["/d".to_owned(), "/s".to_owned(), "/c".to_owned()],
+        ShellKind::Posix => vec!["-c".to_owned()],
+    };
+    (shell, kind.as_str(), args)
+}
+
+fn bubblewrap_base_command(
+    config: &Config,
+    project: &ProjectContext,
+    workdir: &Path,
+) -> Result<Command> {
+    let mut command = Command::new("/usr/bin/bwrap");
+    command.args([
+        "--unshare-all",
+        "--share-net",
+        "--die-with-parent",
+        "--new-session",
+    ]);
+    for path in [
+        "/usr",
+        "/bin",
+        "/lib",
+        "/lib64",
+        "/usr/local",
+        "/etc/ssl",
+        "/etc/resolv.conf",
+        "/etc/hosts",
+        "/etc/nsswitch.conf",
+        "/etc/passwd",
+        "/etc/group",
+    ] {
+        if Path::new(path).exists() {
+            command.args(["--ro-bind", path, path]);
+        }
+    }
+    command.args([
+        "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--bind",
+    ]);
+    command.arg(&project.project_root);
+    let relative_workdir = workdir
+        .strip_prefix(&project.project_root)
+        .map_err(|_| AppError::new("PATH_OUTSIDE_WORKSPACE", "process workdir escaped project"))?;
+    let sandbox_workdir = if relative_workdir.as_os_str().is_empty() {
+        "/workspace".to_owned()
+    } else {
+        format!(
+            "/workspace/{}",
+            relative_workdir.to_string_lossy().replace('\\', "/")
+        )
+    };
+    command.args(["/workspace", "--chdir", &sandbox_workdir, "--dir", "/run"]);
+    if let Some(socket) = &config.container_socket {
+        let socket = socket.canonicalize().map_err(|error| {
+            AppError::new(
+                "SANDBOX_UNAVAILABLE",
+                format!("configured container socket is unavailable: {error}"),
+            )
+        })?;
+        command.args([
+            "--bind",
+            socket.to_string_lossy().as_ref(),
+            "/run/podman.sock",
+        ]);
+    }
+    if let Some(root) = &config.container_config_root {
+        let root = root.canonicalize().map_err(|error| {
+            AppError::new(
+                "SANDBOX_UNAVAILABLE",
+                format!("configured container config root is unavailable: {error}"),
+            )
+        })?;
+        command.args([
+            "--ro-bind",
+            root.to_string_lossy().as_ref(),
+            "/etc/containers",
+        ]);
+    }
+    Ok(command)
+}
+
+fn bubblewrap_base_std_command(
+    config: &Config,
+    project: &ProjectContext,
+    workdir: &Path,
+) -> Result<StdCommand> {
+    let mut command = StdCommand::new("/usr/bin/bwrap");
+    command.args([
+        "--unshare-all",
+        "--share-net",
+        "--die-with-parent",
+        "--new-session",
+    ]);
+    for path in [
+        "/usr",
+        "/bin",
+        "/lib",
+        "/lib64",
+        "/usr/local",
+        "/etc/ssl",
+        "/etc/resolv.conf",
+        "/etc/hosts",
+        "/etc/nsswitch.conf",
+        "/etc/passwd",
+        "/etc/group",
+    ] {
+        if Path::new(path).exists() {
+            command.args(["--ro-bind", path, path]);
+        }
+    }
+    command.args([
+        "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--bind",
+    ]);
+    command.arg(&project.project_root);
+    let relative_workdir = workdir
+        .strip_prefix(&project.project_root)
+        .map_err(|_| AppError::new("PATH_OUTSIDE_WORKSPACE", "process workdir escaped project"))?;
+    let sandbox_workdir = if relative_workdir.as_os_str().is_empty() {
+        "/workspace".to_owned()
+    } else {
+        format!(
+            "/workspace/{}",
+            relative_workdir.to_string_lossy().replace('\\', "/")
+        )
+    };
+    command.args(["/workspace", "--chdir", &sandbox_workdir, "--dir", "/run"]);
+    if let Some(socket) = &config.container_socket {
+        let socket = socket.canonicalize().map_err(|error| {
+            AppError::new(
+                "SANDBOX_UNAVAILABLE",
+                format!("configured container socket is unavailable: {error}"),
+            )
+        })?;
+        command.args([
+            "--bind",
+            socket.to_string_lossy().as_ref(),
+            "/run/podman.sock",
+        ]);
+    }
+    if let Some(root) = &config.container_config_root {
+        let root = root.canonicalize().map_err(|error| {
+            AppError::new(
+                "SANDBOX_UNAVAILABLE",
+                format!("configured container config root is unavailable: {error}"),
+            )
+        })?;
+        command.args([
+            "--ro-bind",
+            root.to_string_lossy().as_ref(),
+            "/etc/containers",
+        ]);
+    }
+    Ok(command)
+}
+
+fn sanitized_base_std_environment(command: &mut StdCommand, use_bwrap: bool) {
+    if cfg!(windows) {
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
+        let path = std::env::var("PATH").unwrap_or_else(|_| {
+            format!(r"{system_root}\System32;{system_root};{system_root}\System32\WindowsPowerShell\v1.0")
+        });
+        command.env("PATH", path);
+        command.env("SystemRoot", &system_root);
+        command.env("WINDIR", &system_root);
+    } else {
+        let path = if use_bwrap {
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned()
+        } else {
+            std::env::var("PATH")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| {
+                    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned()
+                })
+        };
+        command.env("PATH", path);
+        command.env("HOME", "/tmp");
+        command.env("TMPDIR", "/tmp");
+        command.env("LANG", "C.UTF-8");
+    }
+}
+
+fn finalize_process_command(
+    mut command: Command,
+    config: &Config,
+    use_bwrap: bool,
+    interactive: bool,
+    timeout: Duration,
+    environment: &BTreeMap<String, String>,
+) -> Result<Command> {
+    command.env_clear();
+    sanitized_base_environment(&mut command, use_bwrap);
+    if let Some(socket) = &config.container_socket {
+        let uri = if use_bwrap {
+            "unix:///run/podman.sock".to_owned()
+        } else {
+            format!("unix://{}", socket.to_string_lossy())
+        };
+        command.env("CONTAINER_HOST", &uri);
+        command.env("DOCKER_HOST", &uri);
+    }
+    for (key, value) in environment {
+        if key.len() > 128
+            || value.len() > 8192
+            || key.contains('=')
+            || key.contains('\0')
+            || value.contains('\0')
+        {
+            return Err(AppError::new(
+                "INVALID_INPUT",
+                "invalid environment addition",
+            ));
+        }
+        command.env(key, value);
+    }
+    process_limits(&mut command, timeout);
+    command
+        .kill_on_drop(true)
+        .stdin(if interactive {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    Ok(command)
+}
+
+pub(crate) fn build_command(
+    config: &Config,
+    project: &ProjectContext,
+    command_text: &str,
+    interactive: bool,
+    timeout: Duration,
+    environment: &BTreeMap<String, String>,
+) -> Result<Command> {
+    build_command_with_options(
+        config,
+        project,
+        command_text,
+        interactive,
+        timeout,
+        environment,
+        &project.project_root,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_command_with_options(
+    config: &Config,
+    project: &ProjectContext,
+    command_text: &str,
+    interactive: bool,
+    timeout: Duration,
+    environment: &BTreeMap<String, String>,
+    workdir: &Path,
+    shell: Option<&str>,
+) -> Result<Command> {
+    let use_bwrap = use_bwrap(config, project, Some(command_text));
+    let sandbox_default_shell = (use_bwrap && shell.is_none()).then_some("/bin/sh");
+    let (shell_bin, shell_args, shell_text) =
+        shell_command(shell.or(sandbox_default_shell), command_text)?;
+    let command = if use_bwrap {
+        let mut command = bubblewrap_base_command(config, project, workdir)?;
+        command.arg(&shell_bin).args(&shell_args).arg(&shell_text);
+        command
+    } else if config.allow_unsandboxed_exec {
+        let mut command = Command::new(&shell_bin);
+        command
+            .args(&shell_args)
+            .arg(&shell_text)
+            .current_dir(workdir);
+        command
+    } else {
+        return Err(AppError::new(
+            "SANDBOX_UNAVAILABLE",
+            "no usable exec backend; Bubblewrap is unavailable and native execution is disabled",
+        ));
+    };
+    finalize_process_command(
+        command,
+        config,
+        use_bwrap,
+        interactive,
+        timeout,
+        environment,
+    )
+}
+
+pub(crate) fn build_argv_command(
+    config: &Config,
+    project: &ProjectContext,
+    executable: &str,
+    arguments: &[String],
+    timeout: Duration,
+    environment: &BTreeMap<String, String>,
+) -> Result<Command> {
+    if executable.is_empty()
+        || executable.len() > 4096
+        || executable.contains(['\0', '\n', '\r'])
+        || arguments
+            .iter()
+            .any(|argument| argument.contains('\0') || argument.contains(['\n', '\r']))
+    {
+        return Err(AppError::new(
+            "INVALID_INPUT",
+            "invalid executable or argv value",
+        ));
+    }
+    let encoded_len = executable
+        .len()
+        .saturating_add(arguments.iter().map(String::len).sum::<usize>());
+    if encoded_len > config.limits.input_string_bytes {
+        return Err(AppError::new(
+            "INPUT_TOO_LARGE",
+            "executable and arguments exceed MAX_INPUT_STRING_BYTES",
+        ));
+    }
+    let use_bwrap = use_bwrap(config, project, Some(executable));
+    let command = if use_bwrap {
+        let mut command = bubblewrap_base_command(config, project, &project.project_root)?;
+        command.arg(executable).args(arguments);
+        command
+    } else if config.allow_unsandboxed_exec {
+        let mut command = Command::new(executable);
+        command.args(arguments).current_dir(&project.project_root);
+        command
+    } else {
+        return Err(AppError::new(
+            "SANDBOX_UNAVAILABLE",
+            "no usable exec backend; Bubblewrap is unavailable and native execution is disabled",
+        ));
+    };
+    finalize_process_command(command, config, use_bwrap, false, timeout, environment)
+}
+
+async fn execute_prepared(
+    mut command: Command,
+    timeout: Duration,
+    output_limit: usize,
+) -> Result<ProcessResult> {
+    let mut child = command
+        .spawn()
+        .map_err(|error| AppError::new("SANDBOX_UNAVAILABLE", error.to_string()))?;
+    let process_id = child.id();
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AppError::new("PROCESS_FAILED", "stdout pipe unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| AppError::new("PROCESS_FAILED", "stderr pipe unavailable"))?;
+    let stdout_task = tokio::spawn(bounded_read(stdout, output_limit));
+    let stderr_task = tokio::spawn(bounded_read(stderr, output_limit));
+    let wait = tokio::time::timeout(timeout, child.wait()).await;
+    let (status, timed_out) = match wait {
+        Ok(status) => (Some(status?), false),
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(process_id) = process_id {
+                unsafe {
+                    libc::kill(-(process_id as i32), libc::SIGKILL);
+                }
+            }
+            #[cfg(windows)]
+            if let Some(process_id) = process_id {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/T", "/F", "/PID", &process_id.to_string()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            let _ = child.kill().await;
+            let status = child.wait().await.ok();
+            (status, true)
+        }
+    };
+    let (stdout, stdout_bytes, stdout_truncated) = stdout_task
+        .await
+        .map_err(|error| AppError::new("PROCESS_FAILED", error.to_string()))??;
+    let (stderr, stderr_bytes, stderr_truncated) = stderr_task
+        .await
+        .map_err(|error| AppError::new("PROCESS_FAILED", error.to_string()))??;
+    Ok(ProcessResult {
+        exit_code: status.and_then(|value| value.code()),
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        timed_out,
+        truncated: stdout_truncated || stderr_truncated,
+        stdout_bytes,
+        stderr_bytes,
+    })
+}
+
+pub async fn execute(
+    config: &Config,
+    project: &ProjectContext,
+    command_text: &str,
+    timeout: Duration,
+    environment: &BTreeMap<String, String>,
+) -> Result<ProcessResult> {
+    if command_text.is_empty() || command_text.len() > config.limits.input_string_bytes {
+        return Err(AppError::new(
+            "INPUT_TOO_LARGE",
+            "command is empty or exceeds MAX_INPUT_STRING_BYTES",
+        ));
+    }
+    let command = build_command(config, project, command_text, false, timeout, environment)?;
+    execute_prepared(command, timeout, config.limits.process_output_bytes).await
+}
+
+pub async fn execute_argv(
+    config: &Config,
+    project: &ProjectContext,
+    executable: &str,
+    arguments: &[String],
+    timeout: Duration,
+    environment: &BTreeMap<String, String>,
+) -> Result<ProcessResult> {
+    let command = build_argv_command(config, project, executable, arguments, timeout, environment)?;
+    execute_prepared(command, timeout, config.limits.process_output_bytes).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ConfigBuilder;
+    use crate::project::ProjectKey;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regression_bwrap_probe_and_runtime_must_use_the_same_executable() {
+        use std::ffi::OsStr;
+
+        let project_dir = tempfile::tempdir().unwrap();
+        let config = ConfigBuilder::from_map(std::collections::BTreeMap::from([
+            ("MCP_AUTH_TOKEN".to_owned(), "1234567890abcdef".to_owned()),
+            ("MCP_EXEC_SANDBOX".to_owned(), "bwrap".to_owned()),
+        ]))
+        .build()
+        .unwrap();
+        let project = ProjectContext {
+            native_project_key: ProjectKey::new("native".to_owned()).unwrap(),
+            effective_project_key: ProjectKey::new("effective".to_owned()).unwrap(),
+            project_alias: None,
+            project_root: project_dir.path().to_path_buf(),
+            metadata_root: project_dir.path().join(".metadata"),
+            transport_mode: crate::request_context::TransportMode::Stateless,
+            mcp_session_present: false,
+        };
+
+        // probe_bwrap() validates /usr/bin/bwrap. The runtime command must use
+        // that exact executable rather than re-resolving "bwrap" through PATH.
+        let command = bubblewrap_base_std_command(&config, &project, project_dir.path()).unwrap();
+        assert_eq!(command.get_program(), OsStr::new("/usr/bin/bwrap"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn yolo_bwrap_keeps_host_network_available() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let config = ConfigBuilder::from_map(std::collections::BTreeMap::from([
+            ("MCP_AUTH_TOKEN".to_owned(), "1234567890abcdef".to_owned()),
+            ("MCP_EXEC_SANDBOX".to_owned(), "bwrap".to_owned()),
+        ]))
+        .build()
+        .unwrap();
+        let project = ProjectContext {
+            native_project_key: ProjectKey::new("native".to_owned()).unwrap(),
+            effective_project_key: ProjectKey::new("effective".to_owned()).unwrap(),
+            project_alias: None,
+            project_root: project_dir.path().to_path_buf(),
+            metadata_root: project_dir.path().join(".metadata"),
+            transport_mode: crate::request_context::TransportMode::Stateless,
+            mcp_session_present: false,
+        };
+        let command = bubblewrap_base_std_command(&config, &project, project_dir.path()).unwrap();
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            args.iter().any(|arg| arg == "--share-net"),
+            "YOLO mode must keep network access available: {args:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_traversal_and_absolute_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let resolver = SecurePathResolver;
+        for path in [
+            "../secret",
+            "../../etc/passwd",
+            "/foo",
+            r"C:\Windows",
+            r"\\server\share",
+        ] {
+            assert!(
+                resolver
+                    .resolve_project_path(directory.path(), path, PathOperation::Create)
+                    .is_err(),
+                "{path}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_escape_for_existing_and_create() {
+        use std::os::unix::fs::symlink;
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), "secret").unwrap();
+        symlink(outside.path(), project.path().join("link")).unwrap();
+        let resolver = SecurePathResolver;
+        assert!(matches!(
+            resolver.resolve_project_path(project.path(), "link/secret", PathOperation::Existing),
+            Err(AppError::Structured {
+                code: "SYMLINK_ESCAPE",
+                ..
+            })
+        ));
+        assert!(matches!(
+            resolver.resolve_project_path(project.path(), "link/new", PathOperation::Create),
+            Err(AppError::Structured {
+                code: "SYMLINK_ESCAPE",
+                ..
+            })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_io_round_trip_move_copy_and_recursive_remove() {
+        let project = tempfile::tempdir().unwrap();
+        let resolver = SecurePathResolver;
+        resolver
+            .write_file_atomic(project.path(), "src/nested/file.txt", b"hello")
+            .unwrap();
+        assert_eq!(
+            resolver
+                .read_file_bounded(project.path(), "src/nested/file.txt", 100)
+                .unwrap(),
+            b"hello"
+        );
+        resolver
+            .copy_file_secure(project.path(), "src/nested/file.txt", "copy.txt", 100)
+            .unwrap();
+        resolver
+            .move_path_secure(project.path(), "copy.txt", "moved/output.txt")
+            .unwrap();
+        assert_eq!(
+            resolver
+                .read_file_bounded(project.path(), "moved/output.txt", 100)
+                .unwrap(),
+            b"hello"
+        );
+        resolver.remove_path_secure(project.path(), "src").unwrap();
+        assert!(!project.path().join("src").exists());
+    }
+
+    #[test]
+    fn ranged_read_does_not_require_the_whole_file_to_fit() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("large.txt"), b"0123456789abcdef").unwrap();
+        let resolver = SecurePathResolver;
+        let (first, total) = resolver
+            .read_file_range(project.path(), "large.txt", 0, 4)
+            .unwrap();
+        let (middle, middle_total) = resolver
+            .read_file_range(project.path(), "large.txt", 8, 4)
+            .unwrap();
+        assert_eq!(first, b"0123");
+        assert_eq!(middle, b"89ab");
+        assert_eq!(total, 16);
+        assert_eq!(middle_total, total);
+        assert!(
+            resolver
+                .read_file_range(project.path(), "large.txt", 17, 4)
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_io_never_follows_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), project.path().join("link")).unwrap();
+        let resolver = SecurePathResolver;
+        assert_eq!(
+            resolver
+                .write_file_atomic(project.path(), "link/escaped.txt", b"no")
+                .unwrap_err()
+                .code(),
+            "SYMLINK_ESCAPE"
+        );
+        assert_eq!(
+            resolver
+                .read_file_bounded(project.path(), "link/secret.txt", 100)
+                .unwrap_err()
+                .code(),
+            "SYMLINK_ESCAPE"
+        );
+        assert!(!outside.path().join("escaped.txt").exists());
+    }
+
+    #[test]
+    fn capability_api_rejects_cross_platform_absolute_forms() {
+        let project = tempfile::tempdir().unwrap();
+        let resolver = SecurePathResolver;
+        for path in ["../x", "/etc/passwd", r"C:\Windows\x", r"\\host\share"] {
+            assert!(
+                resolver
+                    .write_file_atomic(project.path(), path, b"no")
+                    .is_err(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn lexical_resolver_accepts_dot_and_normal_nested_paths() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join("src/nested")).unwrap();
+        std::fs::write(project.path().join("src/nested/file.txt"), "ok").unwrap();
+        let resolver = SecurePathResolver;
+        assert_eq!(
+            resolver
+                .resolve_project_path(project.path(), ".", PathOperation::Existing)
+                .unwrap(),
+            project.path().canonicalize().unwrap()
+        );
+        assert!(
+            resolver
+                .resolve_project_path(
+                    project.path(),
+                    "./src/nested/file.txt",
+                    PathOperation::Existing
+                )
+                .unwrap()
+                .ends_with("src/nested/file.txt")
+        );
+    }
+
+    #[test]
+    fn lexical_resolver_rejects_empty_null_backslash_and_oversized_paths() {
+        let project = tempfile::tempdir().unwrap();
+        let resolver = SecurePathResolver;
+        for path in ["", "a\0b", r"a\b"] {
+            assert_eq!(
+                resolver
+                    .resolve_project_path(project.path(), path, PathOperation::Create)
+                    .unwrap_err()
+                    .code(),
+                "PATH_OUTSIDE_WORKSPACE",
+                "{path:?}"
+            );
+        }
+        let oversized = "a".repeat(4097);
+        assert_eq!(
+            resolver
+                .resolve_project_path(project.path(), &oversized, PathOperation::Create)
+                .unwrap_err()
+                .code(),
+            "PATH_OUTSIDE_WORKSPACE"
+        );
+    }
+
+    #[test]
+    fn create_resolution_allows_missing_tail_but_existing_resolution_does_not() {
+        let project = tempfile::tempdir().unwrap();
+        let resolver = SecurePathResolver;
+        let create = resolver
+            .resolve_project_path(project.path(), "new/deep/file.txt", PathOperation::Create)
+            .unwrap();
+        assert!(create.ends_with("new/deep/file.txt"));
+        assert_eq!(
+            resolver
+                .resolve_project_path(project.path(), "new/deep/file.txt", PathOperation::Existing)
+                .unwrap_err()
+                .code(),
+            "FILE_NOT_FOUND"
+        );
+    }
+
+    #[test]
+    fn bounded_read_accepts_exact_limit_and_rejects_one_byte_over() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("data.bin"), b"12345").unwrap();
+        let resolver = SecurePathResolver;
+        assert_eq!(
+            resolver
+                .read_file_bounded(project.path(), "data.bin", 5)
+                .unwrap(),
+            b"12345"
+        );
+        assert_eq!(
+            resolver
+                .read_file_bounded(project.path(), "data.bin", 4)
+                .unwrap_err()
+                .code(),
+            "RESOURCE_LIMIT_EXCEEDED"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn regression_bounded_read_rejects_fifo_without_waiting_for_peer() {
+        use std::ffi::CString;
+        use std::io::Write as _;
+        use std::os::unix::ffi::OsStrExt;
+        use std::time::{Duration, Instant};
+
+        let project = tempfile::tempdir().unwrap();
+        let fifo = project.path().join("pipe");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+        // Keep the current blocking implementation finite: after one second a
+        // peer opens the FIFO and writes one byte. A safe regular-file reader
+        // should reject the FIFO before this peer is needed.
+        let writer_path = fifo.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            if let Ok(mut writer) = std::fs::OpenOptions::new().write(true).open(writer_path) {
+                let _ = writer.write_all(b"x");
+            }
+        });
+
+        let started = Instant::now();
+        let result = SecurePathResolver.read_file_bounded(project.path(), "pipe", 16);
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "FIFO must be rejected as non-regular; elapsed={elapsed:?}, result={result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "FIFO open blocked waiting for a peer: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn ranged_read_supports_eof_and_zero_length_windows() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("data.bin"), b"12345").unwrap();
+        let resolver = SecurePathResolver;
+        let (empty, total) = resolver
+            .read_file_range(project.path(), "data.bin", 5, 10)
+            .unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(total, 5);
+        let (zero, total) = resolver
+            .read_file_range(project.path(), "data.bin", 2, 0)
+            .unwrap();
+        assert!(zero.is_empty());
+        assert_eq!(total, 5);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_overwrite_preserves_executable_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("script.sh");
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o751)).unwrap();
+        SecurePathResolver
+            .write_file_atomic(project.path(), "script.sh", b"new")
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o751
+        );
+    }
+
+    #[test]
+    fn powershell_invocation_propagates_native_exit_code() {
+        let (shell, args, script) = shell_command(Some("pwsh"), "native-command").unwrap();
+        assert_eq!(shell, "pwsh");
+        assert_eq!(args.last().map(String::as_str), Some("-Command"));
+        assert!(script.contains("$LASTEXITCODE"));
+        assert!(script.contains("exit $LASTEXITCODE"));
+    }
+
+    #[test]
+    fn shell_classification_strips_exe_case_insensitively() {
+        for shell in ["cmd.Exe", "PowerShell.Exe", "pwsh.EXE"] {
+            let (_, args, _) = shell_command(Some(shell), "echo ok").unwrap();
+            if shell.to_ascii_lowercase().starts_with("cmd") {
+                assert_eq!(args.last().map(String::as_str), Some("/c"));
+            } else {
+                assert_eq!(args.last().map(String::as_str), Some("-Command"));
+            }
+        }
+    }
+
+    #[test]
+    fn shell_classification_handles_names_paths_and_unknown_shells() {
+        for shell in [
+            "/bin/sh",
+            "/bin/bash",
+            "zsh",
+            "fish",
+            r"C:\Program Files\Git\bin\bash.exe",
+        ] {
+            assert_eq!(shell_kind(shell), ShellKind::Posix, "{shell}");
+        }
+        for shell in [
+            "powershell",
+            "pwsh",
+            "PowerShell.EXE",
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        ] {
+            assert_eq!(shell_kind(shell), ShellKind::PowerShell, "{shell}");
+        }
+        for shell in ["cmd", "cmd.exe", r"C:\Windows\System32\cmd.EXE"] {
+            assert_eq!(shell_kind(shell), ShellKind::Cmd, "{shell}");
+        }
+    }
+
+    #[test]
+    fn shell_command_arguments_follow_explicit_shell_not_host_platform() {
+        let (_, posix_args, posix_script) = shell_command(Some("bash"), "echo ok").unwrap();
+        assert_eq!(posix_args, ["-c"]);
+        assert_eq!(posix_script, "echo ok");
+
+        let (_, powershell_args, powershell_script) =
+            shell_command(Some("powershell.exe"), "native-command").unwrap();
+        assert_eq!(powershell_args, ["-NoLogo", "-NoProfile", "-Command"]);
+        assert!(powershell_script.contains("$LASTEXITCODE"));
+
+        let (_, cmd_args, cmd_script) = shell_command(Some("cmd.exe"), "echo ok").unwrap();
+        assert_eq!(cmd_args, ["/d", "/s", "/c"]);
+        assert_eq!(cmd_script, "echo ok");
+    }
+
+    #[test]
+    fn shell_command_rejects_control_characters_and_oversized_executable() {
+        for shell in ["bad\nshell", "bad\rshell", "bad\0shell"] {
+            assert_eq!(
+                shell_command(Some(shell), "echo ok").unwrap_err().code(),
+                "INVALID_INPUT"
+            );
+        }
+        let long = "s".repeat(4097);
+        assert_eq!(
+            shell_command(Some(&long), "echo ok").unwrap_err().code(),
+            "INVALID_INPUT"
+        );
+    }
+
+    #[test]
+    fn default_exec_shell_reports_args_consistent_with_detected_kind() {
+        use crate::config::ConfigBuilder;
+        use std::collections::BTreeMap;
+        let config = ConfigBuilder::from_map(BTreeMap::from([(
+            "MCP_AUTH_TOKEN".to_owned(),
+            "1234567890abcdef".to_owned(),
+        )]))
+        .build()
+        .unwrap();
+        let (shell, kind, args) = default_exec_shell(&config);
+        assert_eq!(shell_kind(&shell).as_str(), kind);
+        match kind {
+            "powershell" => assert_eq!(args.last().map(String::as_str), Some("-Command")),
+            "cmd" => assert_eq!(args.last().map(String::as_str), Some("/c")),
+            _ => assert_eq!(args, ["-c"]),
+        }
+    }
+
+    #[test]
+    fn podman_commands_are_detected_without_special_casing_other_engines() {
+        for command in [
+            "podman run --rm alpine true",
+            "/usr/bin/podman ps",
+            "FOO=1 podman build .",
+            "printf x | podman load",
+            "env FOO=1 podman ps",
+        ] {
+            assert!(invokes_podman(command), "{command}");
+        }
+        for command in [
+            "printf podman-image",
+            "echo podman",
+            "FOO=1 docker build .",
+            "buildah bud .",
+        ] {
+            assert!(!invokes_podman(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn podman_falls_back_only_when_its_bwrap_probe_fails() {
+        assert!(should_use_bwrap("auto", true, false, false));
+        assert!(should_use_bwrap("auto", true, true, true));
+        assert!(!should_use_bwrap("auto", true, true, false));
+        assert!(!should_use_bwrap("auto", false, false, false));
+        assert!(!should_use_bwrap("none", true, false, true));
+    }
+
+    #[test]
+    fn posix_invocation_is_not_wrapped_as_powershell() {
+        let (_, args, script) = shell_command(Some("/bin/bash"), "printf ok").unwrap();
+        assert_eq!(args, ["-c"]);
+        assert_eq!(script, "printf ok");
+    }
+    #[test]
+    fn exec_env_additions_reject_malformed_keys_and_oversized_values() {
+        let config = ConfigBuilder::from_map(BTreeMap::new()).build().unwrap();
+        let project = ProjectContext {
+            native_project_key: ProjectKey::new("native".to_owned()).unwrap(),
+            effective_project_key: ProjectKey::new("effective".to_owned()).unwrap(),
+            project_alias: None,
+            project_root: std::env::temp_dir(),
+            metadata_root: std::env::temp_dir().join(".metadata"),
+            transport_mode: crate::request_context::TransportMode::Stateless,
+            mcp_session_present: false,
+        };
+        let build = |environment: BTreeMap<String, String>| {
+            let workdir = project.project_root.clone();
+            build_command_with_options(
+                &config,
+                &project,
+                "echo ok",
+                true,
+                Duration::from_secs(10),
+                &environment,
+                &workdir,
+                None,
+            )
+        };
+
+        let mut oversized_value = BTreeMap::new();
+        oversized_value.insert("BIG".to_owned(), "x".repeat(8193));
+        assert_eq!(build(oversized_value).unwrap_err().code(), "INVALID_INPUT");
+
+        let mut key_with_equals = BTreeMap::new();
+        key_with_equals.insert("BAD=KEY".to_owned(), "v".to_owned());
+        assert_eq!(build(key_with_equals).unwrap_err().code(), "INVALID_INPUT");
+
+        // A well-formed addition must pass and reach the command environment.
+        let mut valid = BTreeMap::new();
+        valid.insert("MY_TOOL_FLAG".to_owned(), "on".to_owned());
+        assert!(build(valid).is_ok());
+    }
+}

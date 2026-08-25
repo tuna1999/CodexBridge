@@ -1,0 +1,7 @@
+/target
+/workspace
+/logs
+/.git
+/.github
+/*.log
+/.env

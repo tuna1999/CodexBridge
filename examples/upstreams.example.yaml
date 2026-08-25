@@ -1,0 +1,17 @@
+mcpServers:
+  docs:
+    command: docs-mcp
+    args:
+      - --stdio
+    type: stdio
+    mode: gateway
+    tools:
+      - search
+      - fetch
+    env:
+      LOG_LEVEL: warn
+
+  remote-index:
+    type: streamable_http
+    url: https://mcp.example.internal/mcp
+    mode: direct
